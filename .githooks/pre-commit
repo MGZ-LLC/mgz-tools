@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+# artefact-version: mgz-tools-publish-gate/1.0
+"""Publish gate for mgz-tools — refuse anything that must not become public.
+
+This repository is PUBLIC. Its whole premise is that nothing internal is in it, and that
+premise cannot rest on someone remembering to look. So the check runs on every commit,
+against the staged content, whether or not anyone thought about it.
+
+WHAT IT LOOKS FOR, and why each axis exists rather than being a general "secrets" scan:
+
+  · CAPABILITY PATHS — an unguessable path segment IS the credential for the service it
+    addresses. It has no entropy signature distinguishable from a hash, so it is matched
+    by shape and by the names it travels under.
+  · INTERNAL ADDRESSES — a LAN range, or a specific host we run. Publishing one is not a
+    secret leak so much as a map, and a map is what an attacker lacks.
+  · INTERNAL HOSTNAMES AND SERVICES — the same, in words rather than numbers.
+  · CREDENTIAL BY CONTEXT — a value is a credential because of the NAME in front of it,
+    however weak the value. A memorable passphrase is low-entropy by construction; that is
+    the entire point of it, and an entropy scan reads it as prose. (Learned the hard way:
+    two WiFi PSKs sat in a private history for three weeks past an entropy-only guard.)
+  · FLEET COUPLING — a tool that reads our coordination store, or knows a contributor id,
+    does not work on a stranger's laptop. That is a fitness failure rather than a security
+    one, and it is refused here because the repo's promise is that everything in it runs.
+
+FAILS CLOSED. Any error while scanning refuses the commit. A guard that silently does not
+run is worse than no guard: it manufactures confidence.
+
+Bypass is `git commit --no-verify`, inherent to git. This is a guard against accident.
+"""
+import re
+import subprocess
+import sys
+
+VERSION = "mgz-tools-publish-gate/1.0"
+if "--version" in sys.argv:
+    print(VERSION)
+    sys.exit(0)
+
+# Each rule is (compiled regex, human explanation of why this must not be published).
+BLOCK = [
+    (re.compile(r"\b192\.168\.\d{1,3}\.\d{1,3}\b"),
+     "an internal LAN address — publishing our topology, not a secret but a map"),
+    (re.compile(r"\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b"),
+     "a private-range address"),
+    (re.compile(r"\bcdn-[0-9a-f]{8}\b", re.I),
+     "a discovery-channel hostname — the channel exists because it is not enumerable"),
+    (re.compile(r"\b[0-9a-f]{20,64}\b(?=[/\"']|\s*$)"),
+     "a long hex token in a path-like position — a capability path IS the credential"),
+    (re.compile(r"\b(mgzllc\.com|station188|hmwizard\.com|mincuzzi\.(asia|cn))\b", re.I),
+     "an internal or personal domain of ours"),
+    (re.compile(r"\b(ms-rosy|msrosy|pm-NUC\w*|pm-P2-MAX|timeline-replica|proxy-[ab]|bastion)\b", re.I),
+     "an internal hostname or service name"),
+    (re.compile(r"""\b(psk|pass|passwd|password|passphrase|secret|token|api[_-]?key)\b\s*[:=]\s*["']?[A-Za-z0-9._@/+-]{6,}""", re.I),
+     "a value named as a credential — the label makes it one, whatever its entropy"),
+    (re.compile(r"~/\.claude|\.claude/crew|\bbbs\b|\bc-\d{3}\b|semaphores/"),
+     "fleet coupling — this cannot run on a stranger's laptop, which is the repo's promise"),
+]
+
+# The docs describe the gate, so they quote the things it blocks. Exempting them by name is
+# narrower than weakening the patterns, and the exemption is visible here rather than implied.
+EXEMPT = {"README.md", "CONTRIBUTING.md", ".githooks/pre-commit", "LICENSE"}
+
+
+def staged_files():
+    out = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM", "-z"],
+        capture_output=True, check=True, text=True).stdout
+    return [f for f in out.split("\0") if f and f not in EXEMPT]
+
+
+def staged_blob(path):
+    return subprocess.run(["git", "show", f":{path}"],
+                          capture_output=True, check=True).stdout
+
+
+findings = []
+try:
+    for path in staged_files():
+        raw = staged_blob(path)
+        if b"\0" in raw[:8000]:
+            continue                      # binary: nothing text-shaped to find
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        for rx, why in BLOCK:
+            m = rx.search(text)
+            if m:
+                line = text[: m.start()].count("\n") + 1
+                snippet = m.group(0)[:24]
+                findings.append((f"{path}:{line}", snippet, why))
+                break                     # one finding per file is enough to stop it
+except Exception as e:                    # FAIL CLOSED — never pass on our own error
+    print(f"{VERSION}: FAILED TO COMPLETE ({e.__class__.__name__}: {e})", file=sys.stderr)
+    print("Refusing the commit. A guard that cannot run must not look like a clean scan.",
+          file=sys.stderr)
+    sys.exit(1)
+
+if findings:
+    print("\n✗ COMMIT REFUSED — this repository is PUBLIC and the staged content is not:\n",
+          file=sys.stderr)
+    for where, snippet, why in findings:
+        print(f"  {where}\n      found: {snippet!r}\n      why:   {why}\n", file=sys.stderr)
+    print("Fix the file, or keep the tool in the internal repository instead — a tool that",
+          file=sys.stderr)
+    print("needs any of the above does not run on a stranger's laptop anyway.\n", file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(0)
