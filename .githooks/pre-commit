@@ -1,19 +1,47 @@
 #!/usr/bin/env python3
-# artefact-version: mgz-tools-publish-gate/1.0
+# artefact-version: mgz-tools-publish-gate/2.0
 """Publish gate for mgz-tools — refuse anything that must not become public.
 
 This repository is PUBLIC. Its whole premise is that nothing internal is in it, and that
 premise cannot rest on someone remembering to look. So the check runs on every commit,
 against the staged content, whether or not anyone thought about it.
 
+⚠️ 2.0 EXISTS BECAUSE 1.0 PUBLISHED THE THING IT GUARDED. Found by c-005 (bbs n-785) after
+the identical defect surfaced in its own gate, and confirmed on this repository's published
+ref: 1.0 listed our hostnames, box models, domains and service names as literal regexes, in
+a file that is itself committed and world-readable, and exempted that file from its own scan
+so it could describe what it blocks.
+
+    A GUARD THAT HAS TO NAME WHAT IT GUARDS, PUBLISHES IT.
+
+And the shape was worse than what it replaced, not smaller: eleven lines of curated internal
+inventory, each annotated with what it is, is strictly more useful to a stranger than the
+same names scattered through source and documentation.
+
+THE FIX IS TO SPLIT THE RULES BY NATURE, which is c-005's design and is adopted here whole:
+
+  · SHAPE rules stay literal. A private IPv4 range, a non-documentation IPv6 prefix, a MAC
+    prefix and a capability-path shape are generic networking facts. Publishing the pattern
+    leaks nothing, because the pattern is not about us.
+  · NAME rules are salted digests. Text is tokenised and re-joined into 1-4 word n-grams under
+    three separators, so `a-b`, `a.b` and `ab` spellings all resolve to the same token; each
+    is hashed and compared against the table below. The names themselves are not in this file.
+
+⚠️ HONEST LIMIT, and it is stated here rather than discovered later: the salt is in the file.
+This defeats READING — a stranger who clones the repo no longer receives an inventory — and it
+does not defeat a determined dictionary attack against guessable names. It is not a secret
+store and must not be treated as one. The alternative considered was an out-of-repo name list,
+rejected because it degrades SILENTLY on any box where the file is missing, and a guard that
+quietly stops guarding is the failure this whole file exists to prevent.
+
 WHAT IT LOOKS FOR, and why each axis exists rather than being a general "secrets" scan:
 
   · CAPABILITY PATHS — an unguessable path segment IS the credential for the service it
     addresses. It has no entropy signature distinguishable from a hash, so it is matched
     by shape and by the names it travels under.
-  · INTERNAL ADDRESSES — a LAN range, or a specific host we run. Publishing one is not a
-    secret leak so much as a map, and a map is what an attacker lacks.
-  · INTERNAL HOSTNAMES AND SERVICES — the same, in words rather than numbers.
+  · INTERNAL ADDRESSES — a LAN range, a ULA or global IPv6 prefix, a MAC. Publishing one is
+    not a secret leak so much as a map, and a map is what an attacker lacks.
+  · INTERNAL NAMES — hosts, boxes, domains, services. Digest-matched, per the split above.
   · CREDENTIAL BY CONTEXT — a value is a credential because of the NAME in front of it,
     however weak the value. A memorable passphrase is low-entropy by construction; that is
     the entire point of it, and an entropy scan reads it as prose. (Learned the hard way:
@@ -25,39 +53,103 @@ WHAT IT LOOKS FOR, and why each axis exists rather than being a general "secrets
 FAILS CLOSED. Any error while scanning refuses the commit. A guard that silently does not
 run is worse than no guard: it manufactures confidence.
 
+⚠️ THE IPv6 WORD-BOUNDARY TRAP, also from c-005 and also present in 1.0 by omission: `\b`
+cannot match between `:` and `/`, so a prefix written `2001:db8::/32` does not match a
+pattern anchored with `\b` after the `::`. IPv6 is matched here without trailing `\b`.
+
 Bypass is `git commit --no-verify`, inherent to git. This is a guard against accident.
 """
+import hashlib
 import re
 import subprocess
 import sys
 
-VERSION = "mgz-tools-publish-gate/1.0"
+VERSION = "mgz-tools-publish-gate/2.0"
 if "--version" in sys.argv:
     print(VERSION)
     sys.exit(0)
 
-# Each rule is (compiled regex, human explanation of why this must not be published).
+SALT = b"mgz-tools-publish-gate/2.0"
+
+# Salted digests of internal names. The plaintext is deliberately absent from this file; see the
+# honest-limit paragraph above for exactly what that does and does not buy.
+NAME_DIGESTS = {
+    "2600274f6373486a",
+    "3b361e1eaf98a163",
+    "3d21daa2562b58ec",
+    "3d6540559a462973",
+    "51d0f4cb442f9170",
+    "561c6d214613493d",
+    "5e8a5b844a08fd4b",
+    "78ccc8e20175d583",
+    "7ae21ffe5f71c420",
+    "8b903be762db1138",
+    "9864ae55d53d336b",
+    "9993ba08358ca548",
+    "b4585b4bb925ce08",
+    "c3d5e8d7ab662e94",
+    "f2aef1c39a83d399",
+    "f33ce0421addebef",
+    "f7902109a7705f3b",
+    "fbdd1bf04c7afc3e",
+    "fcadc8918833f2b0",
+}
+
+def _tokens(text):
+    """1-4 word n-grams, re-joined three ways, lowercased.
+
+    `foo-bar`, `foo.bar`, `foobar` and `FOO BAR` all have to reach the same digest, because a
+    name written the other way round is the same disclosure. Splitting on non-alphanumerics and
+    re-joining under three separators is what makes the table spelling-independent.
+
+    ⚠ THE EXAMPLE ABOVE IS FICTIONAL ON PURPOSE, and it was not on the first draft. Writing a
+    real hostname here to illustrate the spellings reproduced 1.0's entire defect inside the file
+    that fixes it, four paragraphs below the sentence explaining why not to. The self-check caught
+    it before the commit, which is the only reason this note is a footnote and not another n-785.
+    """
+    words = [w for w in re.split(r"[^A-Za-z0-9]+", text.lower()) if w]
+    for i in range(len(words)):
+        for n in (1, 2, 3, 4):
+            if i + n > len(words):
+                break
+            g = words[i:i + n]
+            for sep in ("", "-", "."):
+                yield sep.join(g)
+
+def name_hit(text):
+    for t in _tokens(text):
+        if hashlib.sha256(SALT + t.encode()).hexdigest()[:16] in NAME_DIGESTS:
+            return t[:24]
+    return None
+
+# SHAPE rules — literal, because the pattern is a generic networking fact and says nothing
+# about us. Each is (compiled regex, human explanation of why this must not be published).
 BLOCK = [
     (re.compile(r"\b192\.168\.\d{1,3}\.\d{1,3}\b"),
      "an internal LAN address — publishing our topology, not a secret but a map"),
     (re.compile(r"\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b"),
      "a private-range address"),
+    # NO TRAILING \b — see the IPv6 trap in the docstring. 2001:db8:: is the documentation
+    # range and is the one global prefix that is safe to write down.
+    (re.compile(r"\bf[cd][0-9a-f]{2}:[0-9a-f:]{2,}", re.I),
+     "an IPv6 ULA prefix — an internal address by another spelling"),
+    (re.compile(r"\b2[0-9a-f]{3}:[0-9a-f]{1,4}:[0-9a-f:]{2,}", re.I),
+     "a global IPv6 prefix — unless it is the 2001:db8:: documentation range, this is ours"),
+    (re.compile(r"\b([0-9a-f]{2}:){4}[0-9a-f]{2}:[0-9a-f]{2}\b", re.I),
+     "a MAC address — identifies a physical box we own"),
     (re.compile(r"\bcdn-[0-9a-f]{8}\b", re.I),
      "a discovery-channel hostname — the channel exists because it is not enumerable"),
     (re.compile(r"\b[0-9a-f]{20,64}\b(?=[/\"']|\s*$)"),
      "a long hex token in a path-like position — a capability path IS the credential"),
-    (re.compile(r"\b(mgzllc\.com|station188|hmwizard\.com|mincuzzi\.(asia|cn))\b", re.I),
-     "an internal or personal domain of ours"),
-    (re.compile(r"\b(ms-rosy|msrosy|pm-NUC\w*|pm-P2-MAX|timeline-replica|proxy-[ab]|bastion)\b", re.I),
-     "an internal hostname or service name"),
-    (re.compile(r"""\b(psk|pass|passwd|password|passphrase|secret|token|api[_-]?key)\b\s*[:=]\s*["']?[A-Za-z0-9._@/+-]{6,}""", re.I),
+    (re.compile(r'''\b(psk|pass|passwd|password|passphrase|secret|token|api[_-]?key)\b\s*[:=]\s*["\']?[A-Za-z0-9._@/+-]{6,}''', re.I),
      "a value named as a credential — the label makes it one, whatever its entropy"),
     (re.compile(r"~/\.claude|\.claude/crew|\bbbs\b|\bc-\d{3}\b|semaphores/"),
      "fleet coupling — this cannot run on a stranger's laptop, which is the repo's promise"),
 ]
 
-# The docs describe the gate, so they quote the things it blocks. Exempting them by name is
-# narrower than weakening the patterns, and the exemption is visible here rather than implied.
+# ⚠️ THE EXEMPTION LIST IS THE HOLE 1.0 SHIPPED THROUGH. It stays, because the docs really do
+# have to quote what the gate blocks — but it no longer covers this file for the NAME axis,
+# because this file no longer contains any name to find. The self-check below asserts that.
 EXEMPT = {"README.md", "CONTRIBUTING.md", ".githooks/pre-commit", "LICENSE"}
 
 
@@ -75,6 +167,18 @@ def staged_blob(path):
 
 findings = []
 try:
+    # SELF-CHECK FIRST, and it is not decoration. The defect this version fixes was the gate
+    # publishing an inventory of the names it blocks. Asserting that this file carries none of
+    # them is the only thing that stops 2.0 regrowing 1.0's hole the next time someone adds a
+    # helpful comment naming a host.
+    me = open(__file__, encoding="utf-8", errors="replace").read()
+    hit = name_hit(me)
+    if hit is not None:
+        print(f"{VERSION}: THE GATE ITSELF NAMES {hit!r}.", file=sys.stderr)
+        print("A guard that has to name what it guards, publishes it. Refusing the commit.",
+              file=sys.stderr)
+        sys.exit(1)
+
     for path in staged_files():
         raw = staged_blob(path)
         if b"\0" in raw[:8000]:
@@ -83,12 +187,15 @@ try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             continue
+        hit = name_hit(text)
+        if hit is not None:
+            findings.append((path, hit, "an internal host, box, domain or service name"))
+            continue
         for rx, why in BLOCK:
             m = rx.search(text)
             if m:
                 line = text[: m.start()].count("\n") + 1
-                snippet = m.group(0)[:24]
-                findings.append((f"{path}:{line}", snippet, why))
+                findings.append((f"{path}:{line}", m.group(0)[:24], why))
                 break                     # one finding per file is enough to stop it
 except Exception as e:                    # FAIL CLOSED — never pass on our own error
     print(f"{VERSION}: FAILED TO COMPLETE ({e.__class__.__name__}: {e})", file=sys.stderr)
@@ -97,7 +204,7 @@ except Exception as e:                    # FAIL CLOSED — never pass on our ow
     sys.exit(1)
 
 if findings:
-    print("\n✗ COMMIT REFUSED — this repository is PUBLIC and the staged content is not:\n",
+    print("\n\u2717 COMMIT REFUSED — this repository is PUBLIC and the staged content is not:\n",
           file=sys.stderr)
     for where, snippet, why in findings:
         print(f"  {where}\n      found: {snippet!r}\n      why:   {why}\n", file=sys.stderr)
