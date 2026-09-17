@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# artefact-version: licence-check/1.0
+# artefact-version: licence-check/1.1
 """licence-check — does this repository say what is in it, and is what is in it compatible?
 
 HIS QUESTION, 2026-09-17: "can they have a specific licensing declaration that simply states what
@@ -90,12 +90,30 @@ def repo_licence(root):
         p = root / name
         if p.exists():
             t = p.read_text(errors="replace")[:4000]
-            for lic in sorted(PERMISSIVE | WEAK_COPYLEFT | STRONG_COPYLEFT, key=len, reverse=True):
-                if lic.lower().replace("-", " ") in t.lower().replace("-", " "):
+            # ⛔ IDENTIFY BY TITLE FIRST, NEVER BY SUBSTRING. 1.0 matched SPDX ids as substrings and
+            # called an Apache-2.0 LICENSE "ISC", because `isc` lives inside "disclaimer" — a word
+            # that appears in every licence ever written. ⚠️ FOUND BY RUNNING THE TOOL ON A REAL
+            # REPOSITORY, not by the fixtures, which used the right words and could not see it:
+            # a three-letter identifier matched loosely will always find a home in legal prose.
+            m = re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+]+)", t)
+            if m:
+                return m.group(1), name
+            TITLES = [
+                (r"Apache License\s*,?\s*Version 2\.0",              "Apache-2.0"),
+                (r"GNU AFFERO GENERAL PUBLIC LICENSE\s*,?\s*Version 3", "AGPL-3.0-only"),
+                (r"GNU GENERAL PUBLIC LICENSE\s*,?\s*Version 3",      "GPL-3.0-only"),
+                (r"GNU GENERAL PUBLIC LICENSE\s*,?\s*Version 2",      "GPL-2.0-only"),
+                (r"GNU LESSER GENERAL PUBLIC LICENSE\s*,?\s*Version 3", "LGPL-3.0-only"),
+                (r"GNU LESSER GENERAL PUBLIC LICENSE\s*,?\s*Version 2\.1", "LGPL-2.1-only"),
+                (r"Mozilla Public License\s*,?\s*Version 2\.0",       "MPL-2.0"),
+                (r"Permission is hereby granted, free of charge",     "MIT"),
+                (r"Redistribution and use in source and binary forms.*?3\. Neither the name",
+                                                                      "BSD-3-Clause"),
+                (r"Permission to use, copy, modify, and/or distribute", "ISC"),
+            ]
+            for rx, lic in TITLES:
+                if re.search(rx, t, re.I | re.S):
                     return lic, name
-            if "Apache License" in t and "2.0" in t:   return "Apache-2.0", name
-            if "MIT License" in t or "Permission is hereby granted, free of charge" in t:
-                return "MIT", name
             return None, name
     return None, None
 
