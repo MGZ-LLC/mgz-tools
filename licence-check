@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+# artefact-version: licence-check/1.0
+"""licence-check — does this repository say what is in it, and is what is in it compatible?
+
+HIS QUESTION, 2026-09-17: "can they have a specific licensing declaration that simply states what
+is in it and how it is covered, using whatever we like for our own part, but singling out what
+differs? If that works that should be the work of the license validation tool."
+
+⭐ YES, AND IT IS A FORMAL STANDARD RATHER THAN A CONVENTION OF OURS: per-file
+`SPDX-License-Identifier:` headers for what differs, plus a LICENSING.md declaring bundled
+components. Apache-2.0 provides for exactly this through its NOTICE mechanism.
+
+⛔ BUT A DECLARATION DESCRIBES; IT DOES NOT CURE — and that is the whole reason this tool exists
+rather than a template. Bundling strong-copyleft code (GPL, AGPL) into a permissively licensed
+tool is not made lawful by declaring it: the terms of the COMBINED work change. ⇒ So the job here
+is separating a mix that a declaration settles from one that it cannot, and refusing the second.
+
+⚠️ NOT LEGAL ADVICE, and the refusals are deliberately the CONSERVATIVE subset. A green result
+means "nothing here is a known-bad combination and everything is attributed". It does not mean a
+lawyer has looked at it. A red result on `needs-a-person` is a question, not a verdict.
+"""
+import os, re, sys
+from pathlib import Path
+
+VERSION = re.search(r"artefact-version:\s*(\S+)", open(__file__).read(4096)).group(1)
+if sys.argv[1:2] == ["--version"]:
+    print(VERSION); sys.exit(0)
+
+# ⛔ THE TABLE IS ABOUT DIRECTION. "Compatible" is not a property of two licences, it is a property
+# of putting INBOUND code into an OUTBOUND work, and it is not symmetric: Apache-2.0 code may go
+# into a GPL-3.0 work and GPL code may not come into an Apache-2.0 one. Getting that backwards is
+# the classic error, so the table is keyed (our licence -> what may come in).
+PERMISSIVE = {"MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "Unlicense",
+              "CC0-1.0", "0BSD"}
+WEAK_COPYLEFT = {"MPL-2.0", "LGPL-2.1-only", "LGPL-2.1-or-later", "LGPL-3.0-only",
+                 "LGPL-3.0-or-later", "EPL-2.0", "CDDL-1.0"}
+STRONG_COPYLEFT = {"GPL-2.0-only", "GPL-2.0-or-later", "GPL-3.0-only", "GPL-3.0-or-later",
+                   "AGPL-3.0-only", "AGPL-3.0-or-later", "SSPL-1.0"}
+
+SOURCE = {".py", ".sh", ".bash", ".js", ".ts", ".c", ".h", ".cpp", ".hpp", ".rs", ".go", ".rb",
+          ".pl", ".lua", ".ino", ".java", ".kt", ".swift", ".m", ".cs", ".php", ".sql"}
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "build", "dist", ".mypy_cache"}
+
+SPDX_RE = re.compile(rb"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+ ]+)")
+
+
+def die(msg, code=2):
+    print(f"licence-check: {msg}", file=sys.stderr); sys.exit(code)
+
+
+def classify(lic):
+    if lic in PERMISSIVE:       return "permissive"
+    if lic in WEAK_COPYLEFT:    return "weak-copyleft"
+    if lic in STRONG_COPYLEFT:  return "strong-copyleft"
+    return "unknown"
+
+
+def verdict(ours, theirs):
+    """May `theirs` be bundled into a work we publish under `ours`? Returns (ok, why)."""
+    o, t = classify(ours), classify(theirs)
+    if t == "unknown":
+        return None, (f"{theirs!r} is not an SPDX identifier this tool knows. That is not a "
+                      f"refusal — it is a question nobody here can answer, so a person must.")
+    if o == "unknown":
+        return None, f"this project's own licence {ours!r} is not one this tool knows"
+    if t == "permissive":
+        return True, "permissive into anything — declare it and keep its notice"
+    if o in ("weak-copyleft", "strong-copyleft"):
+        return True, f"{t} into {o} — the outbound work already carries copyleft terms"
+    if t == "weak-copyleft":
+        return True, ("weak copyleft into a permissive work is workable ONLY while it stays a "
+                      "SEPARATE file or library — modifications to it stay under its own terms. "
+                      "Declare it and do not fold it into your own sources.")
+    # strong copyleft into permissive — the case the question was really about
+    return False, (f"{theirs} into a {ours} work. ⛔ A DECLARATION CANNOT FIX THIS: the terms of "
+                   f"the COMBINED work change, so publishing it as {ours} would be a claim we are "
+                   f"not entitled to make. Remove it, replace it, or publish the whole tool under "
+                   f"{theirs}.")
+
+
+def repo_licence(root):
+    """The project's own licence: LICENSE's SPDX id if we can tell, else the declaration says."""
+    dec = root / "LICENSING.md"
+    if dec.exists():
+        m = re.search(r"^own[- ]licence:\s*(\S+)", dec.read_text(errors="replace"),
+                      re.I | re.M)
+        if m:
+            return m.group(1), "LICENSING.md"
+    for name in ("LICENSE", "LICENCE", "LICENSE.txt", "LICENSE.md", "COPYING"):
+        p = root / name
+        if p.exists():
+            t = p.read_text(errors="replace")[:4000]
+            for lic in sorted(PERMISSIVE | WEAK_COPYLEFT | STRONG_COPYLEFT, key=len, reverse=True):
+                if lic.lower().replace("-", " ") in t.lower().replace("-", " "):
+                    return lic, name
+            if "Apache License" in t and "2.0" in t:   return "Apache-2.0", name
+            if "MIT License" in t or "Permission is hereby granted, free of charge" in t:
+                return "MIT", name
+            return None, name
+    return None, None
+
+
+def declared(root):
+    """Third-party components from LICENSING.md: '- path: X' then 'licence: Y'."""
+    dec = root / "LICENSING.md"
+    if not dec.exists():
+        return []
+    out, cur = [], None
+    for line in dec.read_text(errors="replace").splitlines():
+        m = re.match(r"^\s*-\s*path:\s*(.+?)\s*$", line)
+        if m:
+            cur = {"path": m.group(1), "licence": None}
+            out.append(cur); continue
+        m = re.match(r"^\s*licen[cs]e:\s*(\S+)", line, re.I)
+        if m and cur is not None:
+            cur["licence"] = m.group(1)
+    return out
+
+
+def walk(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for f in filenames:
+            p = Path(dirpath) / f
+            if p.suffix.lower() in SOURCE or (p.suffix == "" and os.access(p, os.X_OK)):
+                yield p
+
+
+def main():
+    a = [x for x in sys.argv[1:] if not x.startswith("-")]
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print(__doc__.strip()); sys.exit(0)
+    root = Path(a[0] if a else ".").resolve()
+    if not root.is_dir():
+        die(f"not a directory: {root}")
+
+    ours, src = repo_licence(root)
+    problems, notes, unattributed = [], [], []
+
+    if not ours:
+        problems.append(("no licence", f"no identifiable licence in {root}. A public repository "
+                                       f"without one is ALL RIGHTS RESERVED, which is the opposite "
+                                       f"of a shared tool."))
+    print(f"{root}")
+    print(f"  own licence: {ours or '— NONE FOUND —'}"
+          f"{f'  (from {src})' if src else ''}")
+
+    comps = declared(root)
+    if comps:
+        print(f"  declared components: {len(comps)}")
+    for c in comps:
+        if not c["licence"]:
+            problems.append((c["path"], "declared with no licence: — a component named but not "
+                                        "attributed is worse than one not named, because the "
+                                        "declaration looks complete"))
+            continue
+        ok, why = verdict(ours, c["licence"]) if ours else (None, "own licence unknown")
+        mark = {True: "ok  ", False: "REFUSE", None: "ASK "}[ok]
+        print(f"    {mark}  {c['path']}  [{c['licence']}]")
+        if ok is False:
+            problems.append((c["path"], why))
+        elif ok is None:
+            notes.append((c["path"], why))
+        elif classify(c["licence"]) == "weak-copyleft":
+            notes.append((c["path"], why))
+
+    # ⇒ EVERY SOURCE FILE IS ATTRIBUTED, OR THE DECLARATION IS NOT A DECLARATION. A file carrying
+    # its own SPDX header is attributed; one under a declared path is attributed; everything else
+    # is covered by the repo licence — which is only true if nobody dropped a foreign file in.
+    dec_paths = [c["path"].rstrip("/") for c in comps]
+    for p in walk(root):
+        rel = str(p.relative_to(root))
+        if any(rel == d or rel.startswith(d + "/") for d in dec_paths):
+            continue
+        head = p.read_bytes()[:4096]
+        m = SPDX_RE.search(head)
+        if m:
+            lic = m.group(1).decode().strip()
+            if ours and lic != ours:
+                ok, why = verdict(ours, lic)
+                if ok is False:
+                    problems.append((rel, f"SPDX header says {lic}. {why}"))
+                elif ok is None:
+                    notes.append((rel, why))
+        else:
+            # A file with no header falls under the repo licence BY ASSUMPTION. That is fine for
+            # our own code and is exactly how foreign code slips in unnoticed, so it is reported
+            # as a COUNT rather than a failure — a list of every file would be noise.
+            unattributed.append(rel)
+
+    if unattributed:
+        print(f"  {len(unattributed)} source file(s) carry no SPDX header and are therefore "
+              f"assumed to be ours, under {ours or 'the repo licence'}")
+
+    for path, why in notes:
+        print(f"\n  ⚠ {path}\n    {why}")
+    for path, why in problems:
+        print(f"\n  ⛔ {path}\n    {why}")
+
+    if problems:
+        print(f"\nREFUSED — {len(problems)} problem(s). A declaration describes; it does not cure.")
+        sys.exit(1)
+    print(f"\nok — everything is attributed and nothing is a known-bad combination."
+          f"\n⚠️ That is not a legal opinion: it means no refusal fired, not that a lawyer looked.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

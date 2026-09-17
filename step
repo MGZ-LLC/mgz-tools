@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+# artefact-version: step/1.3
+"""step — the standard step library for `chain`.
+
+Every step here meets the contract `chain` requires (Pietro, 2026-09-16):
+
+    step <name> <dry|run> <declared parameters, in declared order, all required>
+
+exiting 0 for ok and non-zero for not-ok, with the info on stdout/stderr. One artefact rather than
+thirty tiny scripts, so there is one version to declare and one place to look — `step list`.
+
+⚠️ DRY AND RUN ARE IDENTICAL FOR A READ-ONLY STEP, and that is not a shortcut: a check does not
+change anything, so there is nothing for `dry` to withhold. `step help <name>` says which steps
+mutate. A step that DOES mutate must honour `dry` by describing what it would do and exiting 0 —
+and nothing outside the step can verify that it did, which is why the contract is asserted by the
+step's author and only shape-checked by the runner.
+
+A step also declares what its check CAN and CANNOT see. `chain` prints that beside the result,
+because a green gate whose scope excludes the defect reads exactly like a passing one.
+"""
+import os, re, subprocess, sys
+from pathlib import Path
+
+VERSION = re.search(r"artefact-version:\s*(\S+)", open(__file__).read(4096)).group(1)
+if sys.argv[1:2] == ["--version"]:
+    print(VERSION); sys.exit(0)
+
+REG = {}
+
+
+def step(params, sees, mutates=False, about=""):
+    def deco(fn):
+        REG[fn.__name__.rstrip("_").replace("_", "-")] = {
+            "fn": fn, "params": params, "sees": sees, "mutates": mutates,
+            "about": about or (fn.__doc__ or "").strip().splitlines()[0]}
+        return fn
+    return deco
+
+
+def sh(argv, cwd=None):
+    r = subprocess.run(argv, capture_output=True, text=True, cwd=cwd)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def tool_path(x):
+    """A tool by name (PATH, then ~/bin) or by path. One resolution for every step that takes one,
+    so `syntax` and `declared` can never disagree about WHICH file they looked at."""
+    from shutil import which
+    p = Path(os.path.expandvars(os.path.expanduser(x)))
+    if p.exists():
+        return p
+    w = which(x)
+    return Path(w) if w else Path.home() / "bin" / x
+
+
+def tool_marker(x):
+    """What ACTUALLY ran, read from the file rather than executed. "lint passed" is not a fact;
+    "lint passed under mylinter/1.17, which sees escaped brackets" is. `chain` folds these
+    into the step's bracket, so a composed run names the procedure and not only the runner."""
+    p = tool_path(x)
+    try:
+        m = re.search(r"artefact-version:\s*(\S+)", p.read_text(errors="replace")[:4096])
+    except OSError:
+        return str(x)
+    return m.group(1) if m else p.name
+
+
+def ok(msg):
+    print(msg); return 0
+
+
+def no(msg):
+    print(msg, file=sys.stderr); return 1
+
+
+# ─── fixtures: the steps that let the runner be tested against a known result ───────────────────
+
+@step([("note", "anything; it is echoed back")], "nothing — it is a fixture", about="always ok")
+def pass_(mode, note):
+    return ok(f"ok: {note}")
+
+
+@step([("note", "anything; it is echoed back")], "nothing — it is a fixture", about="always not-ok")
+def fail(mode, note):
+    return no(f"not ok: {note}")
+
+
+# ─── the checks ────────────────────────────────────────────────────────────────────────────────
+
+@step([("path", "file or directory that must be there")], "presence, not content or permissions")
+def exists(mode, path):
+    """a path is present"""
+    p = Path(os.path.expandvars(os.path.expanduser(path)))
+    return ok(f"present: {p}") if p.exists() else no(f"absent: {p}")
+
+
+@step([("tool", "a bash or python script, by name (PATH, then ~/bin) or by path")],
+      "whether it PARSES — not whether it runs, and not what it does")
+def syntax(mode, tool):
+    """a script parses"""
+    p = tool_path(tool)
+    if not p.exists():
+        return no(f"absent: {p}")
+    head = p.read_bytes()[:128]
+    if b"python" in head:
+        rc, out = sh(["python3", "-c",
+                      "import ast,sys;ast.parse(open(sys.argv[1]).read())", str(p)])
+    else:
+        rc, out = sh(["bash", "-n", str(p)])
+    return ok(f"parses: {p}") if rc == 0 else no(f"syntax error in {p}\n{out.rstrip()}")
+
+
+@step([("tool", "an executable in PATH carrying an artefact-version marker")],
+      "the marker against what --version PRINTS — not against what the tool DOES")
+def declared(mode, tool):
+    """a tool's --version agrees with its artefact-version marker"""
+    path = tool_path(tool)
+    if not path.exists():
+        return no(f"not on PATH and not in ~/bin: {tool}")
+    m = re.search(r"artefact-version:\s*(\S+)", path.read_text(errors="replace")[:4096])
+    if not m:
+        return no(f"no '# artefact-version:' marker in {path}")
+    rc, out = sh([str(path), "--version"])
+    if rc != 0:
+        return no(f"{tool} --version exited {rc}: {out.strip()}")
+    said = out.strip().splitlines()[0] if out.strip() else ""
+    if said != m.group(1):
+        return no(f"{tool} says {said!r}, marker says {m.group(1)!r}")
+    return ok(f"{tool} {said}")
+
+
+@step([("script", "a test script; its exit code is the verdict")],
+      "only the assertions that suite makes, under the versions it ran against")
+def tests(mode, script):
+    """a test suite passes"""
+    p = Path(os.path.expandvars(os.path.expanduser(script)))
+    if not p.exists():
+        return no(f"no such suite: {p}")
+    print(f"RAN: {tool_marker(str(p))}")
+    rc, out = sh(["bash", str(p)])
+    tail = "\n".join(out.rstrip().splitlines()[-25:])
+    if rc != 0:
+        return no(f"{p} exited {rc}\n{tail}")
+    print(tail)
+    return ok(f"passed: {p}")
+
+
+@step([("dir", "a directory of versioned artefacts")],
+      "declared version vs marker — NOT whether either is the version that was tested, and NOT an "
+      "artefact carrying no --version handler at all (it declares that as a BLIND: line)")
+def drift(mode, dir):
+    """no artefact in a directory has drifted from its declared version"""
+    d = os.path.expandvars(os.path.expanduser(dir))
+    print(f"RAN: {tool_marker('ver')}")
+    rc, out = sh(["ver", "--drift", d])
+    # ⛔ MATCH THE ROW, NOT THE SUMMARY WORD. The first version of this gate was
+    #   ! ver --drift | grep -q DRIFTED
+    # and it FAILED ON A CLEAN TREE, because the summary line reads "… 0 DRIFTED" and carries the
+    # word whether or not anything drifted.
+    rows = [l for l in out.splitlines() if re.match(r"^DRIFT\b", l)]
+    if rows:
+        return no("drifted:\n" + "\n".join(rows))
+    if rc != 0:
+        return no(f"ver --drift exited {rc}\n{out.rstrip()}")
+    # ⛔ `ver` REPORTS "0 DRIFTED" ON A TREE IT HAS ALSO FLAGGED AS UNCHECKABLE. An artefact with a
+    # marker and no --version handler cannot drift, because there is nothing to compare — so this
+    # gate goes green over exactly the files it could not check. Declare it rather than inherit it.
+    m = re.search(r"(\d+) executable without a handler", out)
+    if m and m.group(1) != "0":
+        print(f"BLIND: {m.group(1)} artefact(s) under {d} carry no --version handler, "
+              f"so this gate could not compare them at all")
+    return ok(f"no drift: {d}")
+
+
+@step([("repo", "a git working tree")],
+      "the local commit count against the upstream REF — not whether the push reached a peer")
+def pushed(mode, repo):
+    """a git repo has nothing unpushed"""
+    d = os.path.expandvars(os.path.expanduser(repo))
+    rc, out = sh(["git", "-C", d, "rev-list", "@{u}..HEAD", "--count"])
+    if rc != 0:
+        return no(f"cannot compare with upstream in {d}: {out.strip()}")
+    n = out.strip()
+    if n != "0":
+        return no(f"{n} commit(s) unpushed in {d}  — it is the PUSH that deploys, not the commit")
+    return ok(f"pushed: {d}")
+
+
+@step([("repo", "a git working tree with an upstream")],
+      "that git reported success — NOT that a peer can now fetch what was pushed",
+      mutates=True)
+def push(mode, repo):
+    """push a git repo to its upstream — THE ONLY MUTATING STEP IN THIS LIBRARY"""
+    d = os.path.expandvars(os.path.expanduser(repo))
+    rc, out = sh(["git", "-C", d, "rev-list", "@{u}..HEAD", "--count"])
+    if rc != 0:
+        return no(f"no upstream to push to in {d}: {out.strip()}")
+    n = out.strip()
+    if n == "0":
+        return ok(f"nothing to push: {d}")
+    if mode == "dry":
+        # ⛔ THIS IS THE HALF NOTHING OUTSIDE THE STEP CAN VERIFY. A step that ignored the mode and
+        # pushed anyway would be indistinguishable from this one to `chain`, which is why the
+        # contract is asserted by the author and only shape-checked by the runner.
+        rc2, what = sh(["git", "-C", d, "log", "@{u}..HEAD", "--oneline"])
+        return ok(f"dry — would push {n} commit(s) from {d}:\n{what.rstrip()}")
+    rc3, out3 = sh(["git", "-C", d, "push"])
+    if rc3 != 0:
+        return no(f"push failed for {d} (exit {rc3}):\n{out3.rstrip()}")
+    print(f"BLIND: git reported success; nothing here confirms a peer can fetch it")
+    return ok(f"pushed {n} commit(s): {d}")
+
+
+@step([("repo", "a git working tree")], "tracked and untracked files, not stashes or other branches")
+def clean(mode, repo):
+    """a git repo has no uncommitted change"""
+    d = os.path.expandvars(os.path.expanduser(repo))
+    rc, out = sh(["git", "-C", d, "status", "--porcelain"])
+    if rc != 0:
+        return no(f"not a git tree: {d}")
+    if out.strip():
+        return no(f"uncommitted in {d}:\n{out.rstrip()}")
+    return ok(f"clean: {d}")
+
+
+@step([("path", "a file or directory"), ("pattern", "a python regex that must NOT appear")],
+      "the literal bytes of the files it reads — nothing about git history or ignored trees")
+def absent(mode, path, pattern):
+    """a pattern appears nowhere under a path"""
+    p = Path(os.path.expandvars(os.path.expanduser(path)))
+    rx = re.compile(pattern)
+    hits = []
+    files = [p] if p.is_file() else sorted(f for f in p.rglob("*") if f.is_file())
+    for f in files:
+        try:
+            for i, line in enumerate(f.read_text(errors="replace").splitlines(), 1):
+                if rx.search(line):
+                    hits.append(f"{f}:{i}: {line.strip()[:120]}")
+        except OSError:
+            continue
+    if hits:
+        return no(f"{len(hits)} match(es) for {pattern!r}:\n" + "\n".join(hits[:20]))
+    return ok(f"no match for {pattern!r} under {p} ({len(files)} file(s) read)")
+
+
+# ─── the interface ─────────────────────────────────────────────────────────────────────────────
+
+USAGE = """step — standard steps for `chain`.
+
+  step list                   every step, its parameters and whether it mutates
+  step help <name>            one step in full
+  step <name> <dry|run> …     run it; exit 0 = ok, non-zero = not ok, info on stdout/stderr
+
+Every step takes the run mode first, then its declared parameters in declared order, all required.
+A read-only check behaves identically in dry and run — there is nothing for dry to withhold."""
+
+
+def cmd_list():
+    w = max(len(k) for k in REG)
+    for name in sorted(REG):
+        s = REG[name]
+        ps = " ".join(f"<{p}>" for p, _ in s["params"])
+        flag = "MUTATES" if s["mutates"] else "read-only"
+        print(f"{name:<{w}}  {flag:<9}  <mode> {ps}")
+        print(f"{'':<{w}}  {s['about']}")
+
+
+def cmd_help(name):
+    if name not in REG:
+        print(f"step: no step '{name}'", file=sys.stderr); sys.exit(2)
+    s = REG[name]
+    print(f"{name} — {s['about']}")
+    print(f"  {'MUTATES — must honour dry' if s['mutates'] else 'read-only — dry and run are the same'}")
+    print(f"  sees: {s['sees']}")
+    print(f"\n  step {name} <dry|run> " + " ".join(f"<{p}>" for p, _ in s["params"]))
+    for p, d in s["params"]:
+        print(f"    {p:<10} {d}")
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(USAGE); sys.exit(0)
+    if a[0] == "list":
+        cmd_list(); sys.exit(0)
+    if a[0] == "help":
+        if len(a) != 2:
+            print("usage: step help <name>", file=sys.stderr); sys.exit(2)
+        cmd_help(a[1]); sys.exit(0)
+    name, rest = a[0], a[1:]
+    if name not in REG:
+        print(f"step: no step '{name}' — `step list`", file=sys.stderr); sys.exit(2)
+    s = REG[name]
+    if not rest:
+        print(f"step: {name} needs a run mode first: dry or run", file=sys.stderr); sys.exit(2)
+    mode, vals = rest[0], rest[1:]
+    if mode not in ("dry", "run"):
+        print(f"step: run mode must be 'dry' or 'run', not {mode!r}", file=sys.stderr); sys.exit(2)
+    if len(vals) != len(s["params"]):
+        want = " ".join(f"<{p}>" for p, _ in s["params"])
+        print(f"step: {name} takes {len(s['params'])} parameter(s): {want} — got {len(vals)}",
+              file=sys.stderr); sys.exit(2)
+    sys.exit(s["fn"](mode, *vals))
+
+
+if __name__ == "__main__":
+    main()

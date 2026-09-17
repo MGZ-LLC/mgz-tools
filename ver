@@ -1,0 +1,940 @@
+#!/usr/bin/env bash
+# ver — declared-version reader, manifest builder and upgrade-safety checker for deployed artefacts
+# artefact-version: ver/6.8
+#
+# THE RULE (Pietro, 2026-08-12): "apply all that was pending" must mean a VERSION CHECK, not an
+# archaeology exercise. Read the installed version, read the available version, upgrade if it is a
+# clean fast-forward, ASK if a conflict may exist. Never diff sources or compare mtimes to decide.
+#
+# Version what you SHIP; measure what you OBSERVE. An artefact (tool, binary, CGI, config, unit)
+# carries a declared version. Live state (leases, ARP, reachability) is measured and never versioned.
+#
+# A version is declared in the artefact itself, not derived from git — a file copied onto a router
+# has no repository to ask. Format `<name>/<major>.<minor>`, matching the schema convention already
+# in use across a fleet (deploy/2, status/1, fingerprint/1).
+#
+#   scripts / text artefacts : a marker comment  `# artefact-version: name/1.0`
+#   compiled binaries        : must answer `--version` with the same string (owner rebuilds)
+#
+# `ver` NEVER executes a script to learn its version — it reads the marker. Executing an arbitrary
+# artefact to interrogate it is how a version check becomes a remote-code-execution surface.
+
+set -uo pipefail
+
+SELF_VERSION="$(sed -n 's/^# artefact-version: *//p' "${BASH_SOURCE[0]}" 2>/dev/null | head -1)"; : "${SELF_VERSION:=ver/6.7}"   # derived from the marker: two declarations in one file WILL drift, and this tool exists to catch exactly that
+
+# Files we never look at, let alone stamp. Backups first (an edited backup is not a backup).
+skip_name() {
+  case "$1" in
+    *.bak|*.bak.*|*.orig|*.old|*~|*.dpkg-*|*.rpm[a-z]*|.git|.git/*) return 0 ;;
+    # Prose and VCS metadata are in the contract's not-applicable set — listing them as
+    # "unversioned" would invite someone to stamp what must never carry a version.
+    *.md|*.txt|.gitignore|.gitattributes|LICENSE|COPYING|README) return 0 ;;
+    # Build caches and editor/vault metadata are not deployed artefacts. Recursion surfaced them
+    # the moment --scan stopped being maxdepth 1.
+    __pycache__/*|*/__pycache__/*|*.pyc|*.pyo|.obsidian/*|*/.obsidian/*|node_modules/*|*/node_modules/*) return 0 ;;
+  esac
+  return 1
+}
+
+# Walk EVERY regular file, not just executables. v1.0 walked `-perm -u+x`, so a tree of correctly
+# marked 644 artefacts (systemd units, configs, build products, sources) scanned as
+# `artefacts:[] , unversioned:[]` — silence identical to a tree with nothing in it. On the
+# compliant path silence was the only output there was. (a peer + a peer + a peer, 2026-08-12.)
+# RECURSE BY DEFAULT. v2.0 walked maxdepth 1, so `--scan pwa/dist` reported scanned=3 for a
+# directory of 7 files — the four under assets/ were never looked at, and a reader saw
+# "versioned=1, unversioned=0" and concluded 100% compliant for a two-thirds-unexamined tree.
+# Real deploy trees are nested: /etc/systemd/system with .d/ drop-ins, /etc/nftables.d, app
+# bundles with assets/. A count is only a coverage claim IF ITS SCOPE IS STATED — otherwise it
+# is the same proxy signal in a new costume. (a peer, 2026-08-12, on its own suggested fix.)
+walk_files() {
+  if [ -n "${2:-}" ]; then find "$1" -maxdepth "$2" -type f 2>/dev/null | sort
+  else find "$1" -type f 2>/dev/null | sort; fi
+}
+VER_TOKEN='[A-Za-z0-9._+-]\+/[0-9]\+\.[0-9]\+'
+HEAD_LINES=60          # how far into a file we look for the marker
+
+die() { printf 'ver: %s\n' "$*" >&2; exit 1; }
+
+# ⛔ STAGE BESIDE THE TARGET AND RENAME — never write an artefact in place.
+# Until 2026-09-13 this stamped with `cat "$tmp" > "$f"`, justified by the comment
+# "(~/bin is a bind mount)". That bind was REMOVED on 2026-09-08, so the justification had
+# outlived the code by five days — and the code it justified is the one thing `bin-mesh-repo`'s
+# own invariant forbids: ~/bin is on PATH for every session on three boxes and is sampled
+# constantly by prompt hooks, and bash executes a script INCREMENTALLY, so a reader landing
+# mid-write runs half an operation with nothing surfaced (a peer, a report — a session executed a
+# half-written script).
+# ⚠️ AND `mktemp`'s DEFAULT IS NOT ENOUGH: /tmp is a different filesystem, where `mv` degrades
+# to copy-then-unlink — not atomic, and the write window it was meant to close comes straight
+# back. The staged file must be a SIBLING of the target for the rename to be atomic.
+mktemp_beside() { mktemp "$(dirname -- "$1")/.ver.XXXXXX"; }
+install_over() {                      # $1 staged temp, $2 target — mode follows the target
+  chmod --reference="$2" "$1" 2>/dev/null || chmod 0755 "$1" 2>/dev/null || true
+  mv -f -- "$1" "$2"
+}
+
+usage() {
+  cat <<'EOF'
+ver — declared versions for deployed artefacts (read, scan, compare)
+
+  ver <path...>                     print each artefact's declared version
+  ver --scan <dir> [--sha] [--no-recurse]
+                                    JSON manifest of a tree (artefact-manifest/3), RECURSIVE
+                                      by default; counts{} states its own scope —
+                                      walks ALL regular files, not just executables, and
+                                      a compliant tree is distinguishable from an
+                                      unscanned one, and from a partly-scanned one.
+                                      Secrets/keys are reported `excluded`, never `unversioned`.
+                                      --sha also records sha256 per artefact
+  ver --check <installed> <available>
+                                    compare two manifests and classify every artefact:
+                                      ok | upgrade | CONFLICT | missing | unversioned
+                                    exit 0 = nothing to do · 10 = upgrades available
+                                    exit 20 = a conflict needs a human decision
+  ver --stamp <file> <name/M.m>     add the version marker (and a --version handler
+                                      for shell scripts) to a file, in place
+  ver --stamp-all <dir> [M.m]       stamp every unversioned executable in a tree (default 1.0);
+                                      skips what is already versioned, reports binaries and
+                                      anything it refused rather than forcing them
+  ver --drift [<dir>]               does each artefact's HEADER agree with what it declares
+                                      about itself in its own code? Static — nothing is
+                                      executed. exit 10 if any artefact drifted
+  ver --which <name>                what will ACTUALLY run for this name, resolved through
+                                      PATH as the shell would, plus anything masked behind
+                                      it. A scan of a directory answers about the
+                                      directory; this answers about what executes.
+  ver --deps <dir>                  verify every declared `# artefact-requires:` is present
+                                      at or above the required version. exit 20 if not —
+                                      a dependent looks healthy while its dependency is
+                                      rolled back, which nothing else detects.
+  ver --shadows [dir...]            find artefacts masked by an earlier PATH entry
+                                      (default: ~/.local/bin ~/bin — the mesh-managed
+                                      dirs; pass dirs explicitly for anything else). A host-local staging dir ahead of
+                                      ~/bin is how you install to ONE box — this is what
+                                      keeps a stale staged build from silently winning
+                                      forever. exit 1 if anything is shadowed.
+  ver --running [path...]           is what you DEPLOYED what is EXECUTING? Reports live
+                                      processes still mapping a replaced (deleted) image —
+                                      the failure every file-level check passes. Default ~/bin.
+                                      exit 1 if any process is serving a stale build.
+  ver --history <path>              every COMMITTED build of an artefact with its declared
+                                      version, plus the command to recover it byte-for-byte.
+                                      Because ~/bin commits binaries, the repo IS the rollback
+                                      store — this is the version->commit lookup it lacked.
+  ver --gaps <dir>                  list only what is NOT versioned yet
+  ver --version | --help
+
+VERSION FORMAT   <name>/<major>.<minor>     e.g.  mytool/1.0, deploy/2.0, status/1.1
+  major  incompatible change — a consumer or caller must be updated too
+  minor  additive/compatible change
+
+COMPARISON RULE (the same shape as bin-sync-git: fast-forward or stop)
+  available > installed, same name   -> upgrade      (safe, apply)
+  equal                              -> ok
+  installed > available              -> CONFLICT     (target is AHEAD — someone changed it
+                                                      there; never silently overwrite)
+  name differs / unparseable         -> CONFLICT
+  one NAME claimed by two artefacts  -> CONFLICT     (cannot compare; give one a role name.
+                                                      Never picks one silently: that emitted a
+                                                      false `upgrade` at exit 0 — an actionable
+                                                      WRONG instruction down the safe path.)
+
+NAMES  a declared name must be unique within the manifest's scope and names the artefact's ROLE.
+  Where the filename already encodes the role, it is the name   (wc-watchdog.service vs .timer)
+  Where two artefacts share a basename, spell the role out      (roled + roled-init)
+  Where there is no filename at all, use what it is known by    (console, dash-shell)
+  present in available, absent in installed -> missing (new artefact, safe to add)
+EOF
+}
+
+# --- read a declared version out of a file, WITHOUT executing it -----------------------------
+# echoes "name/M.m<TAB>source" or nothing
+# `#` is not a comment in every format an artefact ships in. v2.0 read only `# artefact-version:`,
+# so a peer's built PWA — which declares correctly via <meta name="artefact-version">, the interface
+# that artefact HAS (rule 8) — scanned as `(unversioned)`. That is worse than silence: the honest
+# response to the accusation is to stamp a `#` line into HTML, which a browser renders as visible
+# text on the page. The tool was inviting the corruption of a compliant artefact. (a peer, 2026-08-12.)
+#
+# So: any line MENTIONING artefact-version declares it, and the version is the last name/M.m token
+# on that line. Covers `#`, `//`, `--`, `;`, `/* */` and <meta name="artefact-version" content="…">.
+read_marker() {
+  local f="$1" line tok
+  while IFS= read -r line; do
+    case "$line" in *artefact-version*) ;; *) continue ;; esac
+    tok="$(printf '%s' "$line" | grep -o "$VER_TOKEN" | tail -1)"
+    [ -n "$tok" ] && { printf '%s\tmarker\n' "$tok"; return 0; }
+  done < <(head -n "$HEAD_LINES" "$f" 2>/dev/null)
+  return 1
+}
+
+# An artefact's identity is (NAME, TARGET), not name alone. Two owners hit the same missing
+# dimension from opposite ends on 2026-08-12:
+#   a peer: two sources -> two targets at the SAME deployed path (/www/cgi-bin/vpn-status on the
+#          Pi4 and the Pi5). A repo scan collided, so they had to mangle a name (`vpn-status-pi5`)
+#          for a file that is called `vpn-status` on disk — losing the one property that made
+#          --check legible.
+#   a peer: ONE source -> six targets (x86_64-linux, aarch64/armv7/i686/x86_64-android) all
+#          declaring `dash-console/0.1` — correct by the naming rule, one artefact with one role,
+#          but --check then reads a phone build and a desktop build as the same artefact at the
+#          same version, interchangeable, when only one may have been rebuilt.
+# Declared with an optional second marker line:  # artefact-target: <token>
+# PROVENANCE + DEPENDENCIES, declared in the artefact for the same reason its version is
+# (rule 3): a binary dropped on a peer has no repo to ask. `~/bin` is a DISTRIBUTION CHANNEL for
+# foreign build products as well as a source of truth for native scripts, and it recorded what an
+# artefact IS while never recording where it came from — so "is bin's libfoo current with its
+# source project?" could not be answered from bin at all. (a peer a report, operator directive.)
+#   # artefact-source:   github:example/libfoo e1a943e
+#   # artefact-requires: libfoo/2.0, deploy/1.0
+field_from_head() {
+  local f="$1" key="$2"
+  local blk
+  if file -b "$f" 2>/dev/null | grep -q ELF; then
+    blk="$(binary_block "$f")" || return 0
+  else
+    blk="$(head -n "$HEAD_LINES" "$f" 2>/dev/null)"
+  fi
+  printf '%s\n' "$blk" | grep -m1 "$key" | sed "s/.*$key[\"[:space:]]*[:=][[:space:]\"]*//; s/[\"].*$//; s/[[:space:]]*$//"
+}
+read_source()   { field_from_head "$1" artefact-source; }
+read_requires() { field_from_head "$1" artefact-requires; }
+
+tgt_from_stream() { sed -n 's/.*artefact-target["[:space:]]*[:=][[:space:]"]*\([A-Za-z0-9._+-]\{1,\}\).*/\1/p' | sed -n 1p; }
+
+read_target() {
+  local f="$1"
+  # A BINARY HAS NO CHANNEL BUT ITS OWN OUTPUT. v4.0 read head -25 of the FILE, which for an ELF
+  # is binary noise, so read_target never fired — and read_binary matched only the version on
+  # line 1 and discarded anything after it. So (name,target) silently degraded to name-only for
+  # exactly the class the field was created for: one source -> six targets is a COMPILED case.
+  # --check then instructed deploying an aarch64-android build over an x86_64-linux one, exit 10,
+  # `0 CONFLICT` — a peer's `roled` failure shape reborn in the binary path. Affected dash-console,
+  # a keyed service and libfoo, one operator action before a router deploy. (a peer, 2026-08-12.)
+  local blk
+  if file -b "$f" 2>/dev/null | grep -q ELF; then
+    blk="$(binary_block "$f")" || return 0
+    printf '%s\n' "$blk" | tgt_from_stream
+    return 0
+  fi
+  head -n "$HEAD_LINES" "$f" 2>/dev/null | grep -m1 artefact-target | tgt_from_stream
+  return 0
+}
+
+# Material that must NEVER carry a marker, and whose failure mode is far worse than prose:
+# a line prepended to a restic repository key makes every backup on the box unrecoverable.
+# Reported as `excluded`, never as `unversioned` — because "unversioned" reads as a to-do.
+# (a peer, 2026-08-12, who tested the hazard on a copy rather than asserting it.)
+is_secret() {
+  case "$(basename "$1")" in
+    password|password.*|*.key|*.pem|*.p12|*.pfx|*.jks|*.gpg|*.asc|id_[a-z]*|*credential*|*secret*) return 0 ;;
+  esac
+  [ "$(stat -c%a "$1" 2>/dev/null)" = "600" ] && return 0
+  return 1
+}
+
+# Binaries cannot carry a comment, so they are the one case we must ask. Guarded: only for ELF,
+# only `--version`, short timeout.
+#
+# CAPTURE WHOLE, THEN TRIM — NEVER `| head` INSIDE A pipefail PIPELINE. `set -o pipefail` plus
+# `head -1` is a race: when the producer has not finished writing, head exits, the producer takes
+# SIGPIPE (141), pipefail propagates it, and the read "fails". The failure was then rendered as
+# `(unversioned)` — so a COMPLIANT binary intermittently read as non-compliant, and worst for the
+# most compliant ones, because an artefact declaring version + target + source prints three lines
+# and races far more often than one printing a single line. Measured by a peer: 3 of 6 concurrent
+# reads of an unchanged file, in 0.00s against a 5s timeout. (a report, 2026-08-12.)
+#
+# Capturing once also means we ask a binary ONCE per scan instead of three times (version, target,
+# source), which is both faster and one less opportunity to race.
+declare -A _VBLOCK _VBLOCK_RC
+binary_block() {
+  local f="$1" out rc
+  if [ -n "${_VBLOCK_RC[$f]:-}" ]; then
+    [ "${_VBLOCK_RC[$f]}" = 0 ] || return 1
+    printf '%s\n' "${_VBLOCK[$f]}"; return 0
+  fi
+  out="$(timeout 5 "$f" --version 2>/dev/null)"; rc=$?
+  _VBLOCK_RC[$f]=$rc; _VBLOCK[$f]="$out"
+  [ $rc -eq 0 ] || return 1
+  printf '%s\n' "$out"
+}
+
+# Returns: 0 + "name/M.m<TAB>exec" declared · 1 not declared · 2 UNREADABLE (could not be asked).
+# The third state is the point. Previously a failed read and a genuine absence of declaration
+# returned the same value, so the caller could not tell "it declares nothing" from "I failed to
+# ask" — the exact conflation already fixed for manifests ("unreadable is not empty"), still
+# present one level down. `unversioned` is the state that INVITES STAMPING, and stamping an ELF
+# corrupts it, so rendering a failed read as a compliance verdict is the dangerous direction.
+read_binary() {
+  local f="$1" out first
+  file -b "$f" 2>/dev/null | grep -q ELF || return 1
+  out="$(binary_block "$f")" || return 2
+  first="${out%%$'\n'*}"
+  if [[ "$first" =~ ([A-Za-z0-9._+-]+)/([0-9]+)\.([0-9]+) ]]; then
+    printf '%s/%s.%s\texec\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+    return 0
+  fi
+  return 1
+}
+
+# 0 declared · 1 not declared · 2 unreadable (see read_binary)
+version_of() {
+  local f="$1" r rc
+  r="$(read_marker "$f")" && { printf '%s\n' "$r"; return 0; }
+  r="$(read_binary "$f")"; rc=$?
+  [ $rc -eq 0 ] && { printf '%s\n' "$r"; return 0; }
+  return $rc
+}
+
+# --- comparison ------------------------------------------------------------------------------
+vname() { printf '%s' "${1%%/*}"; }
+vmaj()  { local v="${1#*/}"; printf '%s' "${v%%.*}"; }
+vmin()  { local v="${1#*/}"; printf '%s' "${v##*.}"; }
+
+# classify installed vs available -> ok|upgrade|CONFLICT
+classify() {
+  local inst="$1" avail="$2"
+  [ "$(vname "$inst")" = "$(vname "$avail")" ] || { echo CONFLICT; return; }
+  local im am in_ an
+  im=$(vmaj "$inst"); am=$(vmaj "$avail"); in_=$(vmin "$inst"); an=$(vmin "$avail")
+  if   [ "$im" -eq "$am" ] && [ "$in_" -eq "$an" ]; then echo ok
+  elif [ "$am" -gt "$im" ] || { [ "$am" -eq "$im" ] && [ "$an" -gt "$in_" ]; }; then echo upgrade
+  else echo CONFLICT; fi
+}
+
+json_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# --- scan ------------------------------------------------------------------------------------
+do_scan() {
+  local root="$1" want_sha="${2:-}" depth="${3:-}" first=1 n_ver=0 n_unver=0 n_excl=0 n_unread=0
+  [ -d "$root" ] || die "not a directory: $root"
+  root="$(cd "$root" && pwd)"
+  declare -A SEEN_NAME
+  local dupes=""
+  printf '{"schema":"artefact-manifest/3","host":"%s","root":"%s","artefacts":[' \
+    "$(json_esc "$(hostname)")" "$(json_esc "$root")"
+  while IFS= read -r f; do
+    local rel v ver via nm sha="" tgt key src req
+    rel="${f#$root/}"; skip_name "$rel" && continue
+    v="$(version_of "$f")" || { case $? in
+        2) n_unread=$((n_unread+1)) ;;
+        *) if is_secret "$f"; then n_excl=$((n_excl+1)); else n_unver=$((n_unver+1)); fi ;;
+      esac; continue; }
+    ver="${v%%$'\t'*}"; via="${v##*$'\t'}"; nm="$(vname "$ver")"
+    tgt="$(read_target "$f")"; key="$nm${tgt:+@$tgt}"
+    src="$(read_source "$f")"; req="$(read_requires "$f")"
+    # A duplicate NAME is a defect, not a detail. Two artefacts answering to one name make
+    # --check compare the wrong pair: a peer's /usr/sbin/roled and /etc/init.d/roled both
+    # scanned as `roled`, producing a false `upgrade roled/1.0 -> roled/3.1` at exit 0 —
+    # an actionable wrong instruction down the SAFE path. Surfaced here, CONFLICT in --check.
+    if [ -n "${SEEN_NAME[$key]:-}" ]; then dupes="$dupes $key"; else SEEN_NAME[$key]="$rel"; fi
+    [ -n "$want_sha" ] && sha="$(sha256sum "$f" 2>/dev/null | cut -c1-16)"
+    [ $first -eq 1 ] || printf ','
+    first=0; n_ver=$((n_ver+1))
+    printf '{"path":"%s","name":"%s","version":"%s","via":"%s"%s%s%s%s}' \
+      "$(json_esc "$rel")" "$(json_esc "$nm")" "$(json_esc "$ver")" "$via" \
+      "${tgt:+,\"target\":\"$(json_esc "$tgt")\"}" \
+      "${src:+,\"source\":\"$(json_esc "$src")\"}" \
+      "${req:+,\"requires\":\"$(json_esc "$req")\"}" \
+      "${sha:+,\"sha256\":\"$sha\"}"
+  done < <(walk_files "$root" "$depth")
+  printf '],"unversioned":['
+  first=1
+  while IFS= read -r f; do
+    local rel="${f#$root/}"; skip_name "$rel" && continue
+    version_of "$f" >/dev/null; [ $? -eq 1 ] || continue   # 0 declared, 2 unreadable -> not here
+    is_secret "$f" && continue
+    [ $first -eq 1 ] || printf ','
+    first=0
+    printf '"%s"' "$(json_esc "$rel")"
+  done < <(walk_files "$root" "$depth")
+  printf '],"excluded":['
+  first=1
+  while IFS= read -r f; do
+    local rel="${f#$root/}"; skip_name "$rel" && continue
+    version_of "$f" >/dev/null && continue
+    is_secret "$f" || continue
+    [ $first -eq 1 ] || printf ','
+    first=0
+    printf '"%s"' "$(json_esc "$rel")"
+  done < <(walk_files "$root" "$depth")
+  # The DENOMINATOR ships with the manifest. Without it a compliant tree and an unscanned tree
+  # produce the same empty output, and the compliant path has no way to prove it looked.
+  printf '],"unreadable":['
+  first=1
+  while IFS= read -r f; do
+    local rel="${f#$root/}"; skip_name "$rel" && continue
+    version_of "$f" >/dev/null; [ $? -eq 2 ] || continue
+    [ $first -eq 1 ] || printf ','
+    first=0
+    printf '"%s"' "$(json_esc "$rel")"
+  done < <(walk_files "$root" "$depth")
+  printf '],"counts":{"scanned":%d,"versioned":%d,"unversioned":%d,"excluded":%d,"unreadable":%d,"recursive":%s,"depth":"%s"},"duplicate_names":[' \
+    "$((n_ver + n_unver + n_excl + n_unread))" "$n_ver" "$n_unver" "$n_excl" "$n_unread" \
+    "$([ -z "$depth" ] && echo true || echo false)" "$([ -z "$depth" ] && echo unlimited || echo "$depth")"
+  first=1
+  for d in $(printf '%s\n' $dupes | sort -u); do
+    [ $first -eq 1 ] || printf ','; first=0; printf '"%s"' "$(json_esc "$d")"
+  done
+  printf ']}\n'
+}
+
+# pull "name<TAB>version" pairs out of a manifest without needing jq
+# Compare on (name, target). Without the target an artefact built for six platforms compares as
+# one row, and --check calls a phone build and a desktop build interchangeable.
+manifest_pairs() {
+  tr -d '\n' < "$1" 2>/dev/null | grep -o '{[[:space:]]*"path"[[:space:]]*:[^}]*}' | while IFS= read -r o; do
+    local n v t
+    n="$(printf '%s' "$o" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    v="$(printf '%s' "$o" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    t="$(printf '%s' "$o" | sed -n 's/.*"target"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    [ -n "$n" ] && printf '%s\t%s\n' "$n${t:+@$t}" "$v"
+  done
+}
+
+# All manifest readers tolerate whitespace. They did not: a manifest that had been through a
+# pretty-printer (json.tool, jq) parsed as ZERO artefacts, and --check then reported
+# `0 up-to-date · 0 upgradable · 0 CONFLICT` and exited 0 — a silently empty comparison that
+# looks exactly like "nothing to do". Same false-ok class as everything else on this thread.
+mf_field() { tr -d '\n' < "$1" 2>/dev/null | grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed -n 1p | sed 's/.*:[[:space:]]*"//; s/"$//'; }
+manifest_host() { mf_field "$1" host; }
+manifest_dupes() { tr -d '\n' < "$1" 2>/dev/null | grep -o '"duplicate_names"[[:space:]]*:[[:space:]]*\[[^]]*\]'  | grep -o '"[^"]*"' | tr -d '"' | grep -v duplicate_names; }
+# Read from the counts OBJECT specifically: the manifest also has an "unversioned" ARRAY, and a
+# looser grep matched `"unversioned":[` first and returned an empty count — a blank denominator is
+# the very silence this field exists to remove.
+manifest_count() { tr -d '\n' < "$1" 2>/dev/null | grep -o '"counts"[[:space:]]*:[[:space:]]*{[^}]*}' | grep -o "\"$2\"[[:space:]]*:[[:space:]]*[0-9]*" | sed -n 1p | grep -o '[0-9]*$'; }
+
+do_check() {
+  local inst_m="$1" avail_m="$2" rc=0 n_ok=0 n_up=0 n_cf=0 n_new=0
+  [ -f "$inst_m" ]  || die "no such manifest: $inst_m"
+  [ -f "$avail_m" ] || die "no such manifest: $avail_m"
+  # A duplicated name poisons every comparison it takes part in, so it is a CONFLICT before we
+  # compare anything — never a silent pick-one.
+  local d dup_any=""
+  for d in $( { manifest_dupes "$inst_m"; manifest_dupes "$avail_m"; } | sort -u ); do
+    printf '  %-12s %-22s two artefacts answer to this name — cannot compare; give one a role name\n' \
+      "CONFLICT" "$d"; dup_any=1; n_cf=$((n_cf+1))
+  done
+  # CROSS-HOST COMPARISON IS NOT AUTOMATICALLY MEANINGFUL. Some artefacts are deliberately
+  # divergent per host and must never be fast-forwarded onto each other — a peer measured .153 and
+  # a second host both declaring `restic-includes/1.0` for intentionally different content, so --check
+  # returned `ok` for a pair where converging them would corrupt a backup set. An artefact that
+  # differs by host IS a different artefact: give it `# artefact-target: <host>` (rule 13).
+  # A manifest that claims N versioned artefacts but parses to none is unreadable, not empty.
+  local m c parsed
+  for m in "$inst_m" "$avail_m"; do
+    c="$(manifest_count "$m" versioned)"; parsed="$(manifest_pairs "$m" | grep -c .)"
+    if [ "${c:-0}" -gt 0 ] && [ "$parsed" -eq 0 ]; then
+      die "$m claims $c versioned artefacts but parsed as 0 — unreadable manifest, refusing to compare (this would otherwise print 'nothing to do' and exit 0)"
+    fi
+    if [ -z "$c" ]; then
+      printf '  WARN  %s has no counts{} — pre-v3 manifest or not produced by ver; coverage unknown\n\n' "$m"
+    fi
+  done
+  local ih ah
+  ih="$(manifest_host "$inst_m")"; ah="$(manifest_host "$avail_m")"
+  if [ -n "$ih" ] && [ -n "$ah" ] && [ "$ih" != "$ah" ]; then
+    printf '  NOTE  comparing across hosts (%s vs %s). Artefacts with no declared target are
+' "$ih" "$ah"
+    printf '        assumed identical by design — if one is deliberately host-specific, give it
+'
+    printf '        `# artefact-target: <host>` or this will report `ok` for a pair that must
+'
+    printf '        never be converged.
+
+'
+  fi
+  declare -A INST DUP
+  for d in $(manifest_dupes "$inst_m") $(manifest_dupes "$avail_m"); do DUP["$d"]=1; done
+  while IFS=$'\t' read -r n v; do [ -n "$n" ] && INST["$n"]="$v"; done < <(manifest_pairs "$inst_m")
+  while IFS=$'\t' read -r n v; do
+    [ -n "$n" ] || continue
+    [ -n "${DUP[$n]:-}" ] && continue          # already reported as a CONFLICT above
+    if [ -z "${INST[$n]:-}" ]; then
+      printf '  %-12s %-22s %s\n' "missing" "$n" "(not installed) -> $v"; n_new=$((n_new+1)); continue
+    fi
+    local c; c="$(classify "${INST[$n]}" "$v")"
+    case "$c" in
+      ok)       n_ok=$((n_ok+1)) ;;
+      upgrade)  printf '  %-12s %-22s %s -> %s\n' "upgrade" "$n" "${INST[$n]}" "$v"; n_up=$((n_up+1)) ;;
+      CONFLICT) printf '  %-12s %-22s installed=%s available=%s  ASK — do not overwrite\n' \
+                  "CONFLICT" "$n" "${INST[$n]}" "$v"; n_cf=$((n_cf+1)) ;;
+    esac
+  done < <(manifest_pairs "$avail_m")
+  # Report the denominator even when there is nothing to say. "Nothing to do" and "nothing was
+  # looked at" must not print the same thing.
+  printf '\n  compared %s installed vs %s available artefacts (%s / %s unversioned, not compared)\n' \
+    "$(manifest_count "$inst_m" versioned)" "$(manifest_count "$avail_m" versioned)" \
+    "$(manifest_count "$inst_m" unversioned)" "$(manifest_count "$avail_m" unversioned)"
+  printf '  %d up-to-date · %d upgradable · %d new · %d CONFLICT\n' "$n_ok" "$n_up" "$n_new" "$n_cf"
+  [ "$n_cf" -gt 0 ] && { echo "  -> a conflict means the target is AHEAD or diverged. Ask before applying."; rc=20; }
+  [ "$rc" -eq 0 ] && [ $((n_up + n_new)) -gt 0 ] && rc=10
+  return $rc
+}
+
+# --- stamp -----------------------------------------------------------------------------------
+# Inserts the marker after the shebang block. For shell scripts also inserts a --version handler
+# guarded on the FIRST argument only, so it cannot disturb any existing option parsing.
+do_stamp() {
+  local f="$1" v="$2"
+  [ -f "$f" ] || die "no such file: $f"
+  [[ "$v" =~ ^[A-Za-z0-9._+-]+/[0-9]+\.[0-9]+$ ]] || die "bad version '$v' (want name/M.m)"
+  if version_of "$f" >/dev/null; then
+    printf 'ver: %s already declares %s — not touching it\n' "$f" "$(version_of "$f" | cut -f1)" >&2
+    return 3
+  fi
+  local first interp tmp; first="$(head -1 "$f")"
+  case "$first" in
+    \#!*) ;;
+    *)
+      # NO SHEBANG => MARKER ONLY, never a --version handler. This is one decision, not a flag
+      # the caller must remember. "No shebang" is a good proxy for "sourced rather than run", and
+      # a handler in a sourced file is catastrophic: a peer's ~/.config/restic/env is sourced by
+      # the whole restic suite, so a handler there would have made `restic-backup.sh --version`
+      # answer `restic-env/1.0` and exit 0 BEFORE backing anything up. (a peer near-miss +
+      # a peer endorsement, 2026-08-12.)
+      grep -Iq . "$f" 2>/dev/null || die "$f is binary — its version must come from its own build"
+      case "$first" in
+        '{'*|'['*|'<'*) die "$f looks like JSON/XML — '#' is not a comment there; declare its version in the format's own way" ;;
+      esac
+      tmp="$(mktemp_beside "$f")"
+      { printf '# artefact-version: %s\n' "$v"; cat "$f"; } > "$tmp"
+      install_over "$tmp" "$f"
+      printf 'ver: stamped %s = %s (marker only — no shebang, so it may be sourced)\n' "$f" "$v"
+      return 0 ;;
+  esac
+  interp="$(printf '%s' "$first" | sed 's|.*/||; s/^env //; s/ .*//')"
+  tmp="$(mktemp_beside "$f")"
+  case "$interp" in
+    python3|python)
+      # The marker COMMENT goes directly under the shebang (comments are not statements, so a
+      # module docstring stays the first statement and __doc__ survives). The --version HANDLER
+      # must go AFTER any docstring, or it would demote it to a bare expression and __doc__
+      # becomes None — which silently breaks every tool that prints __doc__ as its usage.
+      python3 - "$f" "$v" "$tmp" <<'PY' || { rm -f "$tmp"; die "$f: refused — could not place handler"; }
+import ast, sys
+src_path, ver, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(src_path, encoding='utf-8').read().splitlines(keepends=True)
+tree = ast.parse("".join(lines))
+i = 0
+while i < len(lines) and lines[i].lstrip().startswith('#') and (i == 0 or 'coding' in lines[i]):
+    i += 1
+ins = i
+b = tree.body
+if b and isinstance(b[0], ast.Expr) and isinstance(getattr(b[0], 'value', None), ast.Constant) \
+   and isinstance(b[0].value.value, str):
+    ins = max(ins, b[0].end_lineno)
+lines.insert(ins, 'import sys as _s; _s.argv[1:2]==["--version"] and (print("%s"), _s.exit(0))\n' % ver)
+lines.insert(i, '# artefact-version: %s\n' % ver)
+open(out_path, 'w', encoding='utf-8').write("".join(lines))
+PY
+      ;;
+    *)
+      { printf '%s\n' "$first"
+        printf '# artefact-version: %s\n' "$v"
+        case "$interp" in
+          bash|sh) printf '[ "${1:-}" = "--version" ] && { echo "%s"; exit 0; }\n' "$v" ;;
+        esac
+        tail -n +2 "$f"
+      } > "$tmp" ;;
+  esac
+  # never leave a broken artefact behind: syntax-check before replacing
+  case "$interp" in
+    bash|sh)        bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; die "$f: refused — result fails bash -n"; } ;;
+    python3|python) python3 -c "import ast,sys;ast.parse(open(sys.argv[1]).read())" "$tmp" 2>/dev/null \
+                      || { rm -f "$tmp"; die "$f: refused — result fails to parse"; } ;;
+  esac
+  install_over "$tmp" "$f"
+  printf 'ver: stamped %s = %s\n' "$f" "$v"
+}
+
+# Stamp every unversioned executable in a tree at a baseline version. The artefact NAME is the
+# basename with a trailing .sh/.py dropped — unless that would collide with another file, in which
+# case the full basename is kept, because a version name that is ambiguous is worse than an ugly one.
+do_stamp_all() {
+  local root="${1:-.}" base="${2:-1.0}" done_n=0 skip_n=0 fail_n=0
+  declare -A TAKEN
+  # seed with names already declared in the tree, so a second pass cannot collide with a first
+  local _n
+  while IFS= read -r _n; do [ -n "$_n" ] && TAKEN[$_n]=1; done < <(do_scan "$root" "" 1 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+  # --stamp-all deliberately stays maxdepth 1 even though --scan now recurses: writing into a
+  # whole subtree is a different and riskier act than reading one, and must be asked for per dir.
+  root="$(cd "$root" && pwd)"
+  local f b name
+  while IFS= read -r f; do
+    # NEVER stamp a backup or a saved-off copy. A backup exists so a bad edit can be undone;
+    # editing it destroys exactly the property it is kept for. (Learned the hard way: the first
+    # full pass stamped 11 `.bak` files in ~/bin and they had to be restored by hand.)
+    case "$(basename "$f")" in
+      *.bak|*.bak.*|*.orig|*.old|*~|*.dpkg-*|*.rpm[a-z]*) skip_n=$((skip_n+1)); continue ;;
+    esac
+    version_of "$f" >/dev/null && { skip_n=$((skip_n+1)); continue; }
+    if file -b "$f" 2>/dev/null | grep -q ELF; then
+      printf '  %-28s BINARY — owner must add --version at build time\n' "$(basename "$f")"
+      fail_n=$((fail_n+1)); continue
+    fi
+    b="$(basename "$f")"; name="${b%.sh}"; name="${name%.py}"
+    [ "$name" != "$b" ] && [ -e "$root/$name" ] && name="$b"
+    # Do not CREATE the collision we now detect. Stripping an extension can map two files onto
+    # one name; the declared name must be unique within the manifest's scope (the naming ruling,
+    # a peer/a peer 2026-08-12), so fall back to the full basename and say so.
+    if [ -n "${TAKEN[$name]:-}" ]; then
+      [ "$name" != "$b" ] && name="$b"
+      if [ -n "${TAKEN[$name]:-}" ]; then
+        printf '  %-28s SKIPPED — name "%s" already claimed by %s; give it a role name\n' \
+          "$b" "$name" "${TAKEN[$name]}"; fail_n=$((fail_n+1)); continue
+      fi
+    fi
+    TAKEN[$name]="$b"
+    if do_stamp "$f" "$name/$base" >/dev/null 2>&1; then done_n=$((done_n+1))
+    else printf '  %-28s REFUSED (no shebang, or would not parse)\n' "$b"; fail_n=$((fail_n+1)); fi
+  done < <(find "$root" -maxdepth 1 -type f -perm -u+x 2>/dev/null | sort)
+  printf '\n  stamped %d · already versioned %d · needs owner/manual %d\n' "$done_n" "$skip_n" "$fail_n"
+}
+
+# SHADOW DETECTION. Host-local staging (~/.local/bin ahead of ~/bin) is the answer to "~/bin has
+# no host-scoped install" — but a staged build that outlives its promotion then SILENTLY SHADOWS
+# the fleet one forever, which is the exact failure class this tool exists for: a thing that looks
+# current and is not. Staging is only safe if shadowing is visible.
+# THE OPERATOR'S DEPENDENCY IDEA, concretely (Pietro via a peer a report). Pure-bin scripts already
+# depend on foreign binaries being present; nothing detects a rollback of the dependency, because
+# the DEPENDENT is native and looks perfectly healthy. Declared with `# artefact-requires:` and
+# checked here: an unmet requirement is a CONFLICT, because applying anything on top of it makes
+# a broken state worse.
+# WHAT WILL ACTUALLY RUN. a peer's objection to a host-local staging dir is exact: a copy ahead of
+# ~/bin in PATH means one artefact exists twice on one box at two versions, and `ver --scan ~/bin`
+# then reports the one that is NOT running — the contract's own ambiguity, reintroduced by install
+# layout. The deeper point is that **a scan of a DIRECTORY is not an answer about what EXECUTES**.
+# So ask the question directly: resolve through PATH exactly as the shell would, and say what is
+# masked behind it.
+# ── --running ───────────────────────────────────────────────────────────────────────────────────
+# IS WHAT I DEPLOYED WHAT IS EXECUTING? Every other mode in this tool answers a question about a
+# FILE. This one answers about a PROCESS, and they come apart the moment a deploy replaces a
+# binary under a running service: the old inode is unlinked but stays mapped, so the process keeps
+# serving the old build indefinitely while the file on disk reads correct.
+#
+# WHY THIS IS THE NASTY ONE (a peer, a report, third occurrence on a second host): THE FILE BEING RIGHT IS
+# EXACTLY WHAT THE FAILURE LOOKS LIKE. `ver`, `--version`, `git log`, mtime — every check anyone
+# naturally reaches for passes. Only the served surface or /proc/<pid>/exe tells the truth. It made
+# the libfoo UI serve 2.17 for a day after 2.26 landed, and recurred at 2.29 with everyone involved
+# aware of it, because knowing is not a mechanism. The artefact-versioning contract's own blind
+# spot, in its own terms: it says declare the version IN the artefact, and the artefact does —
+# nobody declared WHICH ARTEFACT IS EXECUTING. Version-on-disk is a proxy for version-running.
+#
+# The test is exact rather than heuristic: the kernel appends " (deleted)" to /proc/<pid>/exe when
+# the mapped inode has been unlinked. No sampling, no guessing.
+do_running() {
+  local targets="$*" t pid exe path rc=0 found=0 dv rv comm
+  [ -n "$targets" ] || targets="$HOME/bin"
+  for pid in /proc/[0-9]*; do
+    exe="$(readlink "$pid/exe" 2>/dev/null)" || continue   # not ours to read → skipped, see note below
+    case "$exe" in *" (deleted)") ;; *) continue ;; esac
+    path="${exe% (deleted)}"
+    # Only report artefacts under the paths we were asked about.
+    local match=""
+    for t in $targets; do
+      case "$path" in "$t"|"$t"/*) match=1; break ;; esac
+      [ -f "$t" ] && [ "$path" = "$t" ] && { match=1; break; }
+    done
+    [ -n "$match" ] || continue
+    found=1; rc=1
+    comm="$(cat "$pid/comm" 2>/dev/null || echo '?')"
+    dv="$(version_of "$path" 2>/dev/null)"; dv="${dv%%$'\t'*}"; [ -n "$dv" ] || dv="unversioned"
+    # Best-effort read of the RUNNING image without executing it: the deleted inode is still
+    # readable through /proc, so a declared marker or a `<name>/<M.m>` literal can be recovered.
+    rv="$(grep -aom1 'artefact-version: [A-Za-z0-9._-]*/[0-9]*\.[0-9]*' "$pid/exe" 2>/dev/null | sed 's/.*: //')"
+    [ -n "$rv" ] || rv="$(grep -aom1 "$(basename "$path")/[0-9]\{1,\}\.[0-9]\{1,\}" "$pid/exe" 2>/dev/null | sed -n 1p)"
+    [ -n "$rv" ] || rv="unknown (could not read a version out of the running image)"
+    printf '  STALE     pid %-7s %-16s running %-24s on disk %s\n' "${pid#/proc/}" "$comm" "$rv" "$dv"
+    printf '            %s\n' "$path"
+  done
+  if [ "$found" = 0 ]; then
+    printf '  ok — no live process is running a replaced (deleted) image under: %s\n' "$targets"
+  else
+    printf '\n  These processes are serving a build that is no longer the file on disk.\n'
+    printf '  Restart them; the file-level checks (ver, --version, git log, mtime) cannot see this.\n'
+  fi
+  # Processes owned by other users are unreadable without privilege and are silently skipped, so a
+  # clean result is "nothing stale THAT I CAN SEE". Said plainly rather than implied, because an
+  # unreadable process reported as healthy would be this defect's own failure mode all over again.
+  [ "$(id -u)" != 0 ] && printf '  (scope: processes owned by %s — run as root to cover the whole box)\n' "$(id -un)"
+  return $rc
+}
+
+# ── --history ───────────────────────────────────────────────────────────────────────────────────
+# Every committed build of an artefact, with its DECLARED version, and the command to get it back.
+#
+# WHY (a peer, a report): `~/bin` commits binaries on purpose, so THE REPO IS ALREADY THE ROLLBACK
+# STORE — any prior build is recoverable byte-for-byte on any box that has the clone. a peer and
+# a peer each spent effort on a deploy-races-the-rollback problem that, for committed artefacts, was
+# already solved; nobody had connected "binaries are committed on purpose" to "rollback". What was
+# actually missing was the lookup: git indexes by commit, and humans think in versions.
+do_history() {
+  local f="${1:-}" repo rel sha date v n=0
+  [ -n "$f" ] || die "--history needs a path"
+  [ -e "$f" ] || die "no such path: $f"
+  repo="$(git -C "$(dirname "$(readlink -f "$f")")" rev-parse --show-toplevel 2>/dev/null)" \
+    || die "$f is not inside a git repository — nothing to recover from"
+  rel="$(realpath --relative-to="$repo" "$f")"
+  printf '  %-22s %-9s %-10s %s\n' VERSION COMMIT DATE SUBJECT
+  while read -r sha date subj; do
+    [ -n "$sha" ] || continue
+    # Read the version out of THAT blob, never by executing it.
+    v="$(git -C "$repo" show "$sha:$rel" 2>/dev/null | grep -aom1 "artefact-version: $VER_TOKEN" | sed 's/.*: //')"
+    [ -n "$v" ] || v="$(git -C "$repo" show "$sha:$rel" 2>/dev/null | grep -aom1 "$(basename "$rel")/[0-9]\{1,\}\.[0-9]\{1,\}" | sed -n 1p)"
+    [ -n "$v" ] || v="(undeclared)"
+    printf '  %-22s %-9s %-10s %s\n' "$v" "${sha:0:8}" "$date" "$(printf '%s' "$subj" | cut -c1-46)"
+    n=$((n+1))
+  done < <(git -C "$repo" log --format='%H %ad %s' --date=short -- "$rel" 2>/dev/null)
+  [ "$n" = 0 ] && { printf '  no committed history for %s\n' "$rel"; return 1; }
+  printf '\n  recover any of them byte-for-byte:\n'
+  printf '    git -C %s show <commit>:%s > /tmp/%s && chmod +x /tmp/%s\n' \
+    "$repo" "$rel" "$(basename "$rel")" "$(basename "$rel")"
+  return 0
+}
+
+do_which() {
+  local n="$1" d f found="" rc=1 seen=""
+  [ -n "$n" ] || die "--which needs an artefact name"
+  for d in $(printf '%s' "$PATH" | tr ':' ' '); do
+    f="$d/$n"; [ -f "$f" ] && [ -x "$f" ] || continue
+    # PATH routinely contains the same directory twice (or two paths to it). Without this a file
+    # is reported as masking ITSELF, which is a false alarm on the one output meant to be trusted.
+    local dup="" p2
+    for p2 in $seen; do [ "$f" -ef "$p2" ] && { dup=1; break; }; done
+    [ -n "$dup" ] && continue
+    seen="$seen $f"
+    # This output calls itself the one meant to be trusted, so it must not render a failed read as
+    # a compliance verdict either — an unreadable artefact says so.
+    local v vrc; v="$(version_of "$f" 2>/dev/null)"; vrc=$?; v="${v%%$'\t'*}"
+    [ $vrc -eq 2 ] && v="(unreadable)"
+    if [ -z "$found" ]; then
+      printf '  RUNS      %-22s %s\n' "${v:-unversioned}" "$f"; found=1; rc=0
+    else
+      printf '  masked    %-22s %s\n' "${v:-unversioned}" "$f"
+    fi
+  done
+  [ -z "$found" ] && { printf '  not on PATH: %s\n' "$n"; return 1; }
+  return $rc
+}
+
+do_deps() {
+  local root="${1:-.}" m rc=0 n_ok=0 n_bad=0
+  m="$(mktemp_beside "$f")"; do_scan "$root" "" "" > "$m" 2>/dev/null
+  declare -A HAVE
+  while IFS=$'\t' read -r n v; do [ -n "$n" ] && HAVE["${n%%@*}"]="$v"; done < <(manifest_pairs "$m")
+  local obj who req dep
+  while IFS= read -r obj; do
+    who="$(printf '%s' "$obj" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    req="$(printf '%s' "$obj" | sed -n 's/.*"requires"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    [ -n "$req" ] || continue
+    for dep in $(printf '%s' "$req" | tr ',' ' '); do
+      local dn="${dep%%/*}" have="${HAVE[${dep%%/*}]:-}"
+      if [ -z "$have" ]; then
+        printf '  MISSING   %-20s requires %-20s — not present at all\n' "$who" "$dep"; n_bad=$((n_bad+1)); rc=20
+      # Requirement met iff INSTALLED >= REQUIRED. classify(a,b) answers "is b an advance on a",
+      # so ask it with the REQUIRED version as the baseline: ok/upgrade => installed is at or
+      # above it. Asking it the other way round returns `upgrade` for a rolled-back dependency
+      # and silently passes — which is what this check exists to catch.
+      elif [ "$(classify "$dep" "$have")" = CONFLICT ]; then
+        printf '  UNMET     %-20s requires %-20s but %s is installed (older)\n' "$who" "$dep" "$have"; n_bad=$((n_bad+1)); rc=20
+      else n_ok=$((n_ok+1)); fi
+    done
+  done < <(tr -d '\n' < "$m" | grep -o '{[[:space:]]*"path"[[:space:]]*:[^}]*}')
+  rm -f "$m"
+  printf '\n  %d requirement(s) satisfied · %d unmet\n' "$n_ok" "$n_bad"
+  [ $n_bad -gt 0 ] && echo "  -> a dependent looks healthy while its dependency is rolled back. Fix before applying anything else."
+  return $rc
+}
+
+do_shadows() {
+  local d f b dirs rc=0
+  # DEFAULT SCOPE IS THE MESH-MANAGED DIRS, NOT $PATH. Scanning /usr/bin is not this tool's job:
+  # third-party artefacts take upstream's version and are explicitly out of the contract's scope.
+  # It is also ruinous — /bin and /usr/bin are largely the same files by symlink, so a full $PATH
+  # sweep produces thousands of "shadow" pairs and asks each of them what it is.
+  dirs="${*:-$HOME/.local/bin $HOME/bin}"
+  # NAMES FIRST, VERSIONS ONLY FOR COLLISIONS. The first cut called version_of on every executable
+  # in $PATH — which runs read_binary, i.e. EXECUTES every ELF on the system with --version. That
+  # is both unusably slow and a straight violation of rule 6 (never execute an artefact to
+  # interrogate it) committed by the tool that states it. Basename comparison is free; only an
+  # actual shadow pair is worth the cost of asking what it is.
+  declare -A FIRST
+  local pairs=""
+  for d in $dirs; do
+    [ -d "$d" ] || continue
+    for f in "$d"/*; do
+      [ -f "$f" ] && [ -x "$f" ] || continue
+      b="$(basename "$f")"; skip_name "$b" && continue
+      if [ -n "${FIRST[$b]:-}" ]; then pairs="$pairs$b"$'\n'; else FIRST[$b]="$f"; fi
+    done
+  done
+  local n win lose wv lv
+  for n in $(printf '%s' "$pairs" | sort -u); do
+    win="${FIRST[$n]}"
+    for d in $dirs; do
+      lose="$d/$n"
+      [ -f "$lose" ] && [ -x "$lose" ] && [ "$lose" != "$win" ] || continue
+      [ "$lose" -ef "$win" ] && continue        # same file by symlink/hardlink: not a shadow
+      wv="$(version_of "$win" 2>/dev/null)"; wv="${wv%%$'\t'*}"
+      lv="$(version_of "$lose" 2>/dev/null)"; lv="${lv%%$'\t'*}"
+      printf '  SHADOWED  %-20s %s (%s)\n' "$n" "$win" "${wv:-unversioned}"
+      printf '            %-20s masks: %s (%s)\n' "" "$lose" "${lv:-unversioned}"
+      rc=1
+    done
+  done
+  [ $rc -eq 0 ] && echo "  no shadowed artefacts across: $dirs"
+  return $rc
+}
+
+# stdout is the WORK LIST — the things a human or a loop may hand to --stamp. So an artefact we
+# merely failed to read must never appear there (same defect as the direct path, but here it does
+# not just misreport: it feeds the one action that corrupts an ELF). Unreadable goes to stderr,
+# named as such, so a pipe gets only genuine gaps and a person still learns what was not examined.
+do_gaps() {
+  local root="${1:-.}" unread=0
+  root="$(cd "$root" && pwd)"
+  while IFS= read -r f; do
+    version_of "$f" >/dev/null; case $? in
+      0) ;;
+      2) printf 'unreadable (not a gap, NOT stampable): %s\n' "${f#$root/}" >&2; unread=$((unread+1)) ;;
+      *) printf '%s\n' "${f#$root/}" ;;
+    esac
+  done < <(find "$root" -maxdepth 1 -type f -perm -u+x 2>/dev/null | sort)
+  [ "$unread" -gt 0 ] && printf '%d artefact(s) could not be read — see above; they are NOT in the list.\n' "$unread" >&2
+  return 0
+}
+
+# --- drift: the header and the tool disagreeing about the same tool -----------------------------
+# WHY THIS EXISTS (operator, 2026-09-08). Two artefacts drifted on one day and BOTH were caught by
+# accident: `agenda` carried `# artefact-version: agenda/1.1` over `VERSION = "agenda/1.0"`, so
+# `ver` reported it two revisions older than it was; and `priming-general` was announced to a peer
+# as 2.2 fleet-wide while its header still said 2.1. Twice in a day is not a slip, it is unenforced
+# — and the whole versioning contract rests on the declaration being true. A tool that lies about
+# its own version turns "apply everything pending" from a version check back into a guess.
+#
+# STATIC ON PURPOSE. Running `--version` on 160 unknown executables to audit them would execute
+# every one of them, including whatever a bad `--version` path does before it prints. So this reads
+# the source: any line that carries a version DECLARATION (a `--version` handler, or a
+# `…VERSION=` assignment) is checked for a literal `<name>/<M.m>` of the artefact's OWN name.
+#
+# Three outcomes, and the distinction matters:
+#   DRIFT        a literal self-declaration that CONTRADICTS the header — the defect
+#   derived      no literal, because the tool reads its own marker — drift is impossible by
+#                construction, which is the best of the three and must not be reported as a fault
+#   no-handler   no `--version` at all. The contract says marker AND handler; without one, nothing
+#                can ask a RUNNING artefact what it is. Counted, not fatal.
+do_drift() {
+  local dir="${1:-$HOME/bin}" out rc
+  [ -d "$dir" ] || die "--drift needs a directory (got '$dir')"
+  out="$(walk_files "$dir" 1 | while IFS= read -r f; do
+      [ -f "$f" ] || continue
+      skip_name "$(basename "$f")" && continue
+      printf '%s\n' "$f"
+    done | tr '\n' '\0' | xargs -0 grep -aHn -E 'artefact-version:|--version|VERSION[[:space:]]*=' 2>/dev/null | awk -F: '
+    /artefact-version:/ {
+      if (!($1 in hdr)) {
+        # A unit file, a config or a data artefact carries a marker and cannot answer --version.
+        cmd = "test -x \"" $1 "\""; runnable[$1] = (system(cmd) == 0); close(cmd)
+        match($0, /artefact-version: [A-Za-z0-9._+-]+\/[0-9]+\.[0-9]+/)
+        if (RSTART) hdr[$1] = substr($0, RSTART+18, RLENGTH-18)
+      }
+      # A SECOND mention of the marker is CODE READING IT — the drift-proof pattern, because the
+      # number exists once in the file. Recognise it, or the check punishes the best practice it
+      # is meant to encourage.
+      else derived[$1] = 1
+      next
+    }
+    { body[$1] = body[$1] "\n" $0 }
+    END {
+      for (f in hdr) {
+        split(hdr[f], p, "/"); name = p[1]
+        n = split(body[f], L, "\n"); found = 0; bad = ""
+        for (i = 1; i <= n; i++) {
+          s = L[i]; if (s == "") continue
+          while (match(s, name "/[0-9]+\\.[0-9]+")) {
+            v = substr(s, RSTART, RLENGTH); found = 1
+            if (v != hdr[f]) bad = bad " " v
+            s = substr(s, RSTART + RLENGTH)
+          }
+        }
+        if (bad != "")            printf "DRIFT\t%s\t%s\t%s\n", f, hdr[f], bad
+        else if (found)           printf "ok\t%s\t%s\t-\n", f, hdr[f]
+        else if (f in derived)    printf "derived\t%s\t%s\t-\n", f, hdr[f]
+        else if (runnable[f])     printf "no-handler\t%s\t%s\t-\n", f, hdr[f]
+        else                      printf "not-runnable\t%s\t%s\t-\n", f, hdr[f]
+      }
+    }')"
+  local d o dv nh
+  d=$(printf '%s\n' "$out" | grep -c '^DRIFT'      || true)
+  o=$(printf '%s\n' "$out" | grep -c '^ok'         || true)
+  dv=$(printf '%s\n' "$out" | grep -c '^derived'   || true)
+  nh=$(printf '%s\n' "$out" | grep -c '^no-handler' || true)
+  local nr; nr=$(printf '%s\n' "$out" | grep -c '^not-runnable' || true)
+  printf '%s\n' "$out" | grep '^DRIFT' | while IFS=$'\t' read -r _ f h bad; do
+    printf 'DRIFT      %-30s header=%-24s but declares:%s\n' "$(basename "$f")" "$h" "$bad"
+  done
+  printf '%s\n' "$out" | grep '^no-handler' | while IFS=$'\t' read -r _ f h _; do
+    printf 'no --version handler: %-24s (%s) — the contract is marker AND handler\n' "$(basename "$f")" "$h"
+  done
+  # STATE THE SCOPE WITH THE COUNT, or the number is just another proxy.
+  printf '\nscanned %s (depth 1): %s consistent, %s derived from the marker, %s not runnable, %s executable without a handler, %s DRIFTED\n' \
+    "$dir" "$o" "$dv" "$nr" "$nh" "$d"
+  [ "${d:-0}" -gt 0 ] && return 10
+  return 0
+}
+
+# --- dispatch --------------------------------------------------------------------------------
+[ $# -eq 0 ] && { usage; exit 1; }
+case "$1" in
+  --version)  echo "$SELF_VERSION"; exit 0 ;;
+  -h|--help)  usage; exit 0 ;;
+  --scan)     shift; d="${1:-.}"; shift || true
+              sha=""; dep=""
+              while [ $# -gt 0 ]; do case "$1" in --sha) sha=1 ;; --no-recurse) dep=1 ;; esac; shift; done
+              do_scan "$d" "$sha" "$dep" ;;
+  --check)    shift; [ $# -eq 2 ] || die "--check needs <installed> <available>"; do_check "$1" "$2" ;;
+  --stamp)    shift; [ $# -eq 2 ] || die "--stamp needs <file> <name/M.m>"; do_stamp "$1" "$2" ;;
+  --stamp-all) shift; do_stamp_all "${1:-.}" "${2:-1.0}" ;;
+  --drift)    shift; do_drift "${1:-$HOME/bin}" ;;
+  --which)    shift; do_which "${1:-}" ;;
+  --running)  shift; do_running "$@" ;;
+  --history)  shift; do_history "${1:-}" ;;
+  --deps)     shift; do_deps "${1:-.}" ;;
+  --shadows)  shift; do_shadows "$@" ;;
+  --gaps)     shift; do_gaps "${1:-.}" ;;
+  -*)         die "unknown option $1 (try --help)" ;;
+  # The direct path must honour read_binary's THIRD state exactly as --scan does. It did not:
+  # `if v="$(version_of …)"` collapses 1 (declares nothing) and 2 (could not be asked) into
+  # "(unversioned)" — a compliance verdict where the tool means "I can't tell". Found by a peer
+  # (a report) on a cross-compiled artefact: reading a binary means EXECUTING it, so an arm64
+  # artefact on this amd64 host is unreadable by construction, and its declared version was
+  # present in the file the whole time. Third instance of the same family (SIGPIPE reads, manifest
+  # "unreadable is not empty"), and the dangerous direction again: `unversioned` is the state that
+  # invites --stamp, and stamping an ELF corrupts it. Exit 2 outranks 1 on a mixed list — "I could
+  # not tell" must not be reported as the milder "nothing declared".
+  *)          rc=0
+              # A BARE NAME IS RESOLVED THROUGH PATH, and a name that resolves to nothing says so
+              # (6.4, found by a peer on a report). `ver sometool` answered "(unversioned)" for an
+              # artefact that declares correctly on line 2, because the argument was treated as a
+              # path relative to $PWD, missed, and the miss was rendered as a compliance verdict —
+              # the FOURTH instance of this family in one tool, and again in the direction that
+              # invites --stamp. `--which` had resolved it correctly all along, which is what made
+              # the direct answer look authoritative rather than uninformed.
+              for f in "$@"; do
+                if [ ! -e "$f" ] && case "$f" in */*) false ;; *) true ;; esac; then
+                  r="$(command -v "$f" 2>/dev/null)" || r=""
+                  if [ -n "$r" ]; then
+                    f="$r"
+                  else
+                    printf '%-40s %s\n' "$f" "(not found — no such file, and nothing by that name on PATH)"
+                    rc=2; continue
+                  fi
+                fi
+                v="$(version_of "$f")"
+                case $? in
+                  0) printf '%-40s %s\n' "$f" "${v%%$'\t'*}" ;;
+                  2) printf '%-40s %s\n' "$f" "(unreadable — could not ask; foreign-arch binary or it exits non-zero on --version)"
+                     rc=2 ;;
+                  *) printf '%-40s %s\n' "$f" "(unversioned)"; [ $rc -eq 2 ] || rc=1 ;;
+                esac
+              done; exit $rc ;;
+esac

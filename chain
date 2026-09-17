@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+# artefact-version: chain/2.9
+"""chain — the SOP sequencer. Run named steps in order, stop at the first failure, record it.
+
+THE STANDARD A STEP MUST MEET (Pietro, 2026-09-16 — this is the whole design):
+  · a step is an ORDINARY SHELL COMMAND that complies with a contract; there is no function library
+  · its FIRST argument is the RUN MODE — `dry` or `run`
+  · every other input is a DECLARED parameter, passed positionally in declared order, all required
+  · it answers ok (exit 0) or not-ok (non-zero) and puts the info on stdout/stderr
+  · NO piping or redirection BETWEEN steps. A step's own implementation may pipe internally; what
+    one step must hand another travels as a parameter. Anything that will not fit the contract is
+    ENCAPSULATED in a script that does.
+  ⭐ A CHAIN RUNNER CALLING A CHAIN IS ITSELF A STEP — `chain run <name> <mode> <args…>` meets the
+    contract above, which makes the design self-checking: if the runner could not satisfy its own
+    standard, the standard would be wrong. Chains therefore compose for free.
+
+⚠️ COMPLIANCE IS ONLY SHAPE-CHECKABLE. `chain check` can verify that a step exists, takes the
+declared number of parameters and returns an exit code. IT CANNOT VERIFY THAT A STEP HONOURS
+`dry` — one that ignores the mode and acts anyway is indistinguishable from outside. The standard
+is a contract the step's AUTHOR asserts; the runner checks its shape, not its honesty.
+
+⛔ NO SHELL. Step commands are executed as argv, never through `sh -c`, so `|`, `>`, `&&` and `;`
+in a `run:` line are refused at parse time rather than silently doing something. This is the rule
+above enforced by construction instead of written down.
+
+WHY IT EXISTS, and the gate-writing lessons that cost real defects (false red vs false green, the
+three exercises, `sees:`): coordination/docs/chain-design-rationale.md — carried out of chain/1.9.
+
+DESCRIPTOR FORMAT
+    # artefact-version: <chain>/<N>
+    chain: <name>
+    about: <one line>
+
+    step: <step-name>
+    run:  <command and any fixed arguments — argv, no pipes, no redirection>
+    args: <how many parameters this step takes>
+    arg:  <param-name> <what it is>
+    sees: <optional: what this step's check CAN and CANNOT see>
+
+`args:` restates the count that the `arg:` lines give, and a disagreement is an error — the point
+is to catch a dropped line, which otherwise shifts every positional argument by one silently.
+Parameter names are chain-wide: two steps naming `repo` receive the same value.
+"""
+import hashlib, os, re, subprocess, sys, time
+from pathlib import Path
+
+VERSION = re.search(r"artefact-version:\s*(\S+)", open(__file__).read(4096)).group(1)
+if sys.argv[1:2] == ["--version"]:
+    print(VERSION); sys.exit(0)
+
+STATE = Path(os.environ.get("CHAIN_STATE", Path.home() / ".local/state/chain"))
+RUNS = STATE / "runs.tsv"
+MODES = ("dry", "run")
+SHELL_META = ("|", ">", "<", "&", ";", "`", "$(")
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def die(msg, code=2):
+    print(f"chain: {msg}", file=sys.stderr); sys.exit(code)
+
+
+def search_dirs():
+    here = Path.cwd()
+    dirs = []
+    for d in [here] + list(here.parents):
+        dirs.append(d / "tools" / "chains")
+        if (d / ".git").exists():
+            break
+    # ⇒ TWO LOCATIONS, and the older one stays. Naming a neutral default is what let this tool be
+    # published; dropping the original would have stopped every descriptor already written against
+    # it from resolving, which is a migration nobody asked for in exchange for a tidier help line.
+    dirs.append(Path.home() / ".config" / "chain")
+    dirs.append(Path.home() / ".claude" / "chains")
+    return dirs
+
+
+def resolve(name):
+    p = Path(name)
+    if p.suffix == ".chain" and p.exists():
+        return p
+    for d in search_dirs():
+        c = d / f"{name}.chain"
+        if c.exists():
+            return c
+    die(f"no chain '{name}'. Looked in: " + ", ".join(str(d) for d in search_dirs()))
+
+
+def parse(path):
+    """Unknown keys are an ERROR, never a no-op — a mistyped field that is silently ignored is how
+    a gate stops gating while the file still looks right."""
+    p = Path(path)
+    if not p.exists():
+        die(f"no descriptor '{path}'")
+    d = {"chain": p.stem, "about": "", "version": "", "terminal": "done",
+         "path": str(p.resolve()), "steps": []}
+    step = None
+
+    def need_step(n, key):
+        if step is None:
+            die(f"{p}:{n}: '{key}:' before any 'step:'")
+
+    for n, raw in enumerate(p.read_text().splitlines(), 1):
+        line = raw.strip()
+        m = re.match(r"^#\s*artefact-version:\s*(\S+)", line)
+        if m:
+            d["version"] = m.group(1); continue
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            die(f"{p}:{n}: not 'key: value' — {line!r}")
+        key, val = line.split(":", 1)
+        key, val = key.strip(), val.strip()
+        if key == "chain":
+            d["chain"] = val
+        elif key == "about":
+            d["about"] = val
+        elif key == "terminal":
+            # ⛔ A CHAIN PREPARES; A PERSON RELEASES. Everything client-facing ends at the operator,
+            # so a sequencer that could hand something over itself would be the wrong tool. A chain
+            # that ends at a human says PREPARED, never PASSED — the wording is the handover.
+            # The word is FREE TEXT and it is PRINTED as the outcome, so a project keeps its own
+            # name for where its chain ends — `prepared`, `ready-to-hand-over`. Only `done` is
+            # special: it means the chain finished the job and nothing is waiting on a person. A
+            # typo cannot hide here, because the word appears in the result of every run.
+            if not re.match(r"^[A-Za-z][A-Za-z0-9-]*$", val):
+                die(f"{p}:{n}: terminal: is one word, letters and hyphens — not {val!r}")
+            d["terminal"] = val
+        elif key == "step":
+            # ⇒ A FORMAT CHANGE SHOULD RECOGNISE ITS OWN PREDECESSOR. A 1.x step packed name,
+            # options and command onto one `|`-delimited line, so it arrives here as a step name
+            # full of pipes. Saying "that is not a valid name" is true and useless; say what it is.
+            if "|" in val:
+                die(f"{p}:{n}: this is a 1.x step line. The command moved to its own 'run:' line "
+                    f"and 'sees=' to its own 'sees:' line; each input the command took is now an "
+                    f"'arg:' line with 'args: <count>'. `chain help` on a ported descriptor shows "
+                    f"the shape; on-fail= is gone — a step that may legitimately fail decides for "
+                    f"itself and exits 0.")
+            if not NAME_RE.match(val):
+                die(f"{p}:{n}: step name {val!r} must be letters, digits, - or _")
+            step = {"name": val, "run": [], "args": None, "params": [], "sees": "", "line": n}
+            d["steps"].append(step)
+        elif key == "run":
+            need_step(n, key)
+            if step["run"]:
+                die(f"{p}:{n}: step '{step['name']}' already has a 'run:'")
+            for meta in SHELL_META:
+                if meta in val:
+                    die(f"{p}:{n}: {meta!r} in a run: line. Steps are executed as argv, never "
+                        f"through a shell — put the pipeline in a script and call that instead.")
+            step["run"] = val.split()
+            if not step["run"]:
+                die(f"{p}:{n}: empty run:")
+        elif key == "args":
+            need_step(n, key)
+            if not val.isdigit():
+                die(f"{p}:{n}: args: takes a number, not {val!r}")
+            step["args"] = int(val)
+        elif key == "arg":
+            need_step(n, key)
+            parts = val.split(None, 1)
+            if not parts or not NAME_RE.match(parts[0]):
+                die(f"{p}:{n}: arg: is '<name> <description>'")
+            pname, desc = parts[0], (parts[1] if len(parts) > 1 else "")
+            if pname in [q[0] for q in step["params"]]:
+                die(f"{p}:{n}: step '{step['name']}' declares '{pname}' twice")
+            step["params"].append((pname, desc))
+        elif key == "sees":
+            need_step(n, key)
+            step["sees"] = val
+        else:
+            die(f"{p}:{n}: unknown key '{key}:' (chain, about, step, run, args, arg, sees)")
+
+    if not d["steps"]:
+        die(f"{p}: no steps")
+    for s in d["steps"]:
+        if not s["run"]:
+            die(f"{p}:{s['line']}: step '{s['name']}' has no 'run:'")
+        if s["args"] is None:
+            die(f"{p}:{s['line']}: step '{s['name']}' must declare 'args: <n>' (0 if it takes none)")
+        if s["args"] != len(s["params"]):
+            die(f"{p}:{s['line']}: step '{s['name']}' declares args: {s['args']} but lists "
+                f"{len(s['params'])} arg: line(s) — one of the two is wrong")
+    return d
+
+
+def locate(cmd0, descriptor):
+    """A relative command in a `run:` line resolves against the DESCRIPTOR's directory, so a
+    procedure travels with the steps it encapsulates instead of only working from one cwd. A bare
+    name (no slash) is left alone and found on PATH as usual."""
+    if "/" not in cmd0 or Path(cmd0).is_absolute():
+        return cmd0
+    here = Path(cmd0)
+    if here.exists():
+        return str(here.resolve())
+    beside = Path(descriptor).parent / cmd0
+    return str(beside.resolve()) if beside.exists() else cmd0
+
+
+def params_of(d):
+    """Chain-wide parameter set, in first-appearance order. Returns [(name, desc)] and conflicts."""
+    order, desc, conflicts = [], {}, []
+    for s in d["steps"]:
+        for pname, pdesc in s["params"]:
+            if pname not in desc:
+                order.append(pname); desc[pname] = (pdesc, s["name"])
+            elif pdesc and desc[pname][0] and pdesc != desc[pname][0]:
+                conflicts.append((pname, desc[pname][1], desc[pname][0], s["name"], pdesc))
+    return [(k, desc[k][0]) for k in order], conflicts
+
+
+def marker_of(cmd0):  # noqa: the path may already be resolved by locate()
+    """Identify the checker WITHOUT running it — the declared artefact-version read from the file,
+    else a hash of it. 'lint passed' is not a fact; 'lint passed under mylinter/1.17' is."""
+    from shutil import which
+    path = cmd0 if (os.path.isabs(cmd0) and os.access(cmd0, os.X_OK)) else which(cmd0)
+    if not path:
+        return "not-found"
+    try:
+        blob = open(path, "rb").read()
+    except OSError:
+        return "unreadable"
+    m = re.search(rb"artefact-version:\s*(\S+)", blob[:4096])
+    if m:
+        return m.group(1).decode()
+    return "sha256:" + hashlib.sha256(blob).hexdigest()[:12]
+
+
+def bind(d, mode, given):
+    """Values for every declared parameter. Positional in declared order, or all name=value."""
+    names = [k for k, _ in params_of(d)[0]]
+    if len(given) != len(names):
+        die(f"{d['chain']} takes {len(names)} parameter(s) ({' '.join(names) or 'none'}), "
+            f"got {len(given)} — `chain help {d['chain']}`", 2)
+    named = [g for g in given if "=" in g and g.split("=", 1)[0] in names]
+    if named and len(named) != len(given):
+        die("mix of positional and name=value arguments — use one form or the other")
+    if named:
+        vals = {}
+        for g in given:
+            k, v = g.split("=", 1)
+            if k in vals:
+                die(f"'{k}' given twice")
+            vals[k] = v
+        return vals
+    return dict(zip(names, given))
+
+
+def cmd_help(args):
+    if not args:
+        die("usage: chain help <chain>")
+    d = parse(resolve(args[0]))
+    names, conflicts = params_of(d)
+    print(f"{d['version'] or d['chain']} — {len(d['steps'])} step(s)"
+          + ("" if d["terminal"] == "done" else
+             f"  · terminal: {d['terminal']} — a person releases"))
+    if d["about"]:
+        print(f"  {d['about']}")
+    print(f"  {d['path']}")
+    print("\nsteps")
+    w = max(len(s["name"]) for s in d["steps"])
+    for i, s in enumerate(d["steps"], 1):
+        ps = " ".join(f"<{k}>" for k, _ in s["params"])
+        print(f"  {i:>2} {s['name']:<{w}}  {' '.join(s['run'])} <mode> {ps}".rstrip())
+        if s["sees"]:
+            print(f"     {'':<{w}}  sees: {s['sees']}")
+    print("\nparameters (all required)")
+    if names:
+        pw = max(len(k) for k, _ in names)
+        for k, v in names:
+            print(f"  {k:<{pw}}  {v}")
+    else:
+        print("  (none)")
+    for c in conflicts:
+        print(f"  ! '{c[0]}' described differently by '{c[1]}' and '{c[3]}'", file=sys.stderr)
+    pos = " ".join(f"<{k}>" for k, _ in names)
+    nam = " ".join(f"{k}=…" for k, _ in names)
+    print(f"\nrun\n  chain run {d['chain']} <dry|run> {pos}".rstrip())
+    if names:
+        print(f"  chain run {d['chain']} <dry|run> {nam}")
+
+
+def cmd_run(args):
+    if not args:
+        die("usage: chain run <chain> <dry|run> [parameters…]   ·   chain run <chain> --help")
+    d = parse(resolve(args[0]))
+    rest = args[1:]
+    if "--help" in rest or "-h" in rest:
+        return cmd_help(args[:1])
+    if not rest:
+        die(f"no run mode. `chain run {d['chain']} <dry|run> …` — `chain help {d['chain']}`")
+    mode, given = rest[0], rest[1:]
+    if mode not in MODES:
+        die(f"run mode must be 'dry' or 'run', not {mode!r}")
+    vals = bind(d, mode, given)
+
+    STATE.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    # ⛔ THE LEDGER KEPT EVERY ROW AND THE LOGS DID NOT. A name resolved to the second collides for
+    # the pair everyone types FIRST — `dry` then `run` — so the live run overwrote the dry one and
+    # two ledger rows pointed at one file holding the later run. Found independently by a peer and
+    # a peer within minutes, and present in my own ledger from this morning: three rows, one path.
+    log = STATE / f"{d['chain']}-{ts}.log"
+    if log.exists():
+        n2 = 2
+        while (STATE / f"{d['chain']}-{ts}-{n2}.log").exists():
+            n2 += 1
+        log = STATE / f"{d['chain']}-{ts}-{n2}.log"
+    started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    lines = [f"chain   {d['version'] or d['chain']}", f"file    {d['path']}",
+             f"mode    {mode}", f"started {started}",
+             "params  " + (" ".join(f"{k}={v}" for k, v in vals.items()) or "(none)"), ""]
+
+    def emit(s):
+        lines.append(s)
+
+    print(f"{d['version'] or d['chain']}  mode={mode}")
+    blind, inherited, ran_all, failed, ran = [], [], [], None, 0
+    for i, s in enumerate(d["steps"], 1):
+        argv = [locate(s["run"][0], d["path"])] + s["run"][1:] + [mode] + \
+               [vals[k] for k, _ in s["params"]]
+        mk = marker_of(argv[0])
+        ran_here = []
+        emit(f"--- step {i} {s['name']}  [{mk}]")  # refined below once the step has spoken
+        emit("    " + " ".join(argv))
+        if s["sees"]:
+            emit(f"    sees: {s['sees']}")
+        t0 = time.time()
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True)
+            out, rc = (r.stdout or "") + (r.stderr or ""), r.returncode
+        except FileNotFoundError:
+            out, rc = f"no such command: {s['run'][0]}\n", 127
+        except PermissionError:
+            out, rc = f"not executable: {s['run'][0]}\n", 126
+        dt = time.time() - t0
+        ran += 1
+        emit(out.rstrip() or "    (no output)")
+        emit(f"    exit {rc}  {dt:.2f}s")
+        for ln in out.splitlines():
+            t = ln.strip()
+            if t.startswith("BLIND:"):
+                blind.append((s["name"], t[6:].strip()))
+            # ⛔ A CHILD CHAIN THAT ENDS AT A PERSON MUST NOT BE REPORTABLE AS DONE BY ITS PARENT.
+            # 1.x had no composition, so the exit code was the only channel and it carried this;
+            # 2.x added the caller and the channel stopped carrying it in the same version. A
+            # parent could have appended a send step after a chain whose whole point is that a
+            # person releases it — the 2026-07-16 shipment with a sequencer's signature on it.
+            # ⛔ `[chain/2.6]` IS TRUE AND IT IS THE VERSION THAT DOES NOT MATTER (a peer). The
+            # bracket named the RUNNER; the fact a reader needs is WHICH PROCEDURE ran, at which
+            # version — and the child's identity was sitting in the parent's log where the scrape
+            # did not look. My own standing question, answering itself one level up: what does the
+            # record contain that the summary does not read?
+            m3 = re.match(r"^RAN:\s*(.+)", t)
+            if m3:
+                ran_here.append(m3.group(1).strip())
+            m2 = re.match(r"^TERMINAL:\s*(\S+)", t)
+            if m2 and m2.group(1) != "done":
+                inherited.append((s["name"], m2.group(1)))
+        if ran_here:
+            keep = [r for r in ran_here
+                    if not any(o != r and o.startswith(r + " ") for o in ran_here)]
+            mk = f"{mk} → " + ", ".join(keep)
+            ran_all += keep
+            emit(f"    ran: {mk}")
+        if rc != 0:
+            print(f"FAIL {i}/{len(d['steps'])} {s['name']}  [{mk}]  exit {rc}")
+            print(f"     {' '.join(argv)}")
+            print(out.rstrip())
+            failed = (s["name"], rc)
+            break
+        print(f"ok   {i}/{len(d['steps'])} {s['name']}  [{mk}]  {dt:.2f}s")
+
+    if failed:
+        outcome = f"FAILED at {failed[0]}"
+    else:
+        term = d["terminal"]
+        if term == "done" and inherited:
+            term = inherited[0][1]
+        word = "PASSED" if term == "done" else term.upper().replace("-", " ")
+        outcome = f"{word} WITH {len(blind)} BLIND SPOT(S)" if blind else word
+    emit(""); emit(f"outcome {outcome}")
+    for name, what in inherited:
+        emit(f"inherited terminal '{what}' from step '{name}'")
+    log.write_text("\n".join(lines) + "\n")
+    # ⚠️ THE DESCRIPTOR PATH IS PART OF THE ROW, not metadata about it. A chain name resolves
+    # against the CURRENT tree, so `ship-to-bin/2` in two projects is two different procedures
+    # wearing one name — and a ledger that records only the name cannot tell you which one ran.
+    HEAD = ("started\tchain\tversion\tmode\toutcome\tsteps_run\tsteps_total\tblind"
+            "\tfile\tlog\n")
+    RUNS.parent.mkdir(parents=True, exist_ok=True)
+    if RUNS.exists() and not RUNS.read_text(errors="replace").startswith(HEAD.split("\t")[0] + "\t"):
+        RUNS.rename(RUNS.with_name("runs-pre-2.0.tsv"))   # one-time: 1.x rows had another shape
+    new = not RUNS.exists()
+    with open(RUNS, "a") as f:
+        if new:
+            f.write(HEAD)
+        f.write(f"{started}\t{d['chain']}\t{d['version']}\t{mode}\t{outcome}\t{ran}\t"
+                f"{len(d['steps'])}\t{len(blind)}\t{d['path']}\t{log}\n")
+
+    # ⇒ DECLARED TOKENS, NOT MESSAGES. A parent scrapes these two lines out of this chain's stdout
+    # exactly as this chain scraped them out of its own steps, so an ending survives any depth of
+    # composition. `BLIND {name}: …` did not: it does not begin with the token the parent looks for,
+    # so the evidence reached the parent's LOG while the parent's SUMMARY contradicted it — which is
+    # worse than losing it. (a peer's framing; it is the second instance today of the same cause,
+    # the summary computed from something narrower than the record.)
+    me = d["version"] or d["chain"]
+    print(f"RAN: {me}")
+    for r in ran_all:
+        print(f"RAN: {me} → {r}")
+    for name, what in inherited:
+        print(f"TERMINAL: {what}   (inherited from step '{name}' — this chain ends at a person)")
+    if d["terminal"] != "done":
+        print(f"TERMINAL: {d['terminal']}")
+    for name, what in blind:
+        print(f"BLIND: {name} — {what}")
+    print(f"{outcome}  ({ran}/{len(d['steps'])} steps, mode={mode})")
+    print(f"log  {log}")
+    sys.exit(0 if not failed else (failed[1] if failed[1] else 1))
+
+
+def cmd_check(args):
+    """Shape only — see the docstring. Parses every descriptor and reports what is checkable
+    WITHOUT running anything: unknown keys, arg-count disagreement, shell metacharacters,
+    commands that do not exist, and parameters two steps describe differently."""
+    from shutil import which
+    targets = []
+    for a in args or [str(d) for d in search_dirs() if d.is_dir()]:
+        p = Path(a)
+        targets += sorted(p.rglob("*.chain")) if p.is_dir() else [p]
+    if not targets:
+        die("nothing to check")
+    bad = 0
+    for t in targets:
+        d = parse(t)           # dies on any structural error, with file:line
+        names, conflicts = params_of(d)
+        notes = []
+        for s in d["steps"]:
+            c = locate(s["run"][0], d["path"])
+            if not which(c) and not os.access(c, os.X_OK):
+                notes.append(f"step '{s['name']}': no such command '{s['run'][0]}'")
+            if not s["sees"]:
+                notes.append(f"step '{s['name']}': no sees: — what can this check NOT see?")
+        for c in conflicts:
+            notes.append(f"'{c[0]}' described differently by '{c[1]}' and '{c[3]}'")
+        hard = [n for n in notes if "no such command" in n or "described differently" in n]
+        mark = "FAIL" if hard else "ok  "
+        bad += bool(hard)
+        print(f"{mark} {d['version'] or d['chain']:<28} {len(d['steps'])} steps, "
+              f"{len(names)} param(s)  {t}")
+        for n in notes:
+            print(f"     {'!' if n in hard else '·'} {n}")
+    sys.exit(1 if bad else 0)
+
+
+def cmd_columns(args):
+    """Run one step against a state known CLEAN and a state known BROKEN, and compare the two.
+
+    ⛔ THE POINT IS THE COMPARISON, NOT EITHER COLUMN. A gate exercised only against a clean state
+    proves it does not INVENT a failure — a false red, which is findable because it stops you. It
+    says nothing about whether the gate can SEE one — a false green, indistinguishable from a
+    working gate, which sits for months. A gate returning the SAME result in both states is a
+    CONSTANT, not a check, and nothing about it asks to be noticed.
+
+    ⛔ THE COLUMNS MUST DIFFER BY ARGUMENT, NEVER BY ENVIRONMENT (a peer, measured against their own
+    fixture): a shim placed in the environment for both columns makes them TWO DIFFERENT PROGRAMS,
+    not one program against two states, and the verb reports CONSTANT AT FAIL. This is the step
+    contract itself — every input is a declared parameter — arriving where it is easiest to forget.
+
+    ⚠️ AND THE COLUMNS MUST DIFFER ONLY IN THE DEFECT. A fixture that differs in two things reports
+    one number for both, and the raw output is the only thing that separates them — a peer measured
+    exactly that today: a fixture read 0 of 7 because the subject had moved AND because it could no
+    longer read the answer, and 'the contract moved' is what both look like.
+    """
+    segs, cur = [], []
+    for a in args:
+        if a == "--":
+            segs.append(cur); cur = []
+        else:
+            cur.append(a)
+    segs.append(cur)
+    mode = "run"
+    if segs and segs[0][:1] == ["--mode"]:
+        mode = segs[0][1]; segs[0] = segs[0][2:]
+    if len(segs) != 3 or not segs[0]:
+        die("usage: chain columns [--mode dry|run] <command…> -- <clean args…> -- <broken args…>")
+    cmd, clean, broken = segs
+    res = {}
+    for label, vals in (("clean", clean), ("broken", broken)):
+        argv = [locate(cmd[0], Path.cwd() / "x")] + cmd[1:] + [mode] + vals
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True)
+            out, rc = (r.stdout or "") + (r.stderr or ""), r.returncode
+        except (FileNotFoundError, PermissionError) as e:
+            out, rc = f"{e}\n", 127
+        res[label] = (rc, out)
+        first = (out.strip().splitlines() or [""])[0][:100]
+        print(f"{label:<7} exit {rc:<4} {first}")
+    cr, br = res["clean"][0], res["broken"][0]
+    # ⚠️ THERE IS NO SEPARATE "FALSE GREEN" VERDICT, and writing one was my first mistake here: a
+    # gate that passes the broken state EITHER also passes the clean one — in which case it is a
+    # constant — or fails it, in which case it is inverted. Exit codes cannot show a false green in
+    # isolation, which is precisely why the false green is the half that sits for months.
+    if cr == br == 0:
+        print("FAIL CONSTANT AT PASS — it passed the state you know is BROKEN as well as the clean "
+              "one. Either the gate cannot SEE this defect, or your broken fixture is not broken.")
+        print("     Check the FIXTURE FIRST: a 'broken' state that is not actually broken reads "
+              "exactly like a blind gate, and the fixture is the cheaper of the two to be wrong.")
+        sys.exit(1)
+    if cr == br:
+        print(f"FAIL CONSTANT AT FAIL — exit {cr} on BOTH states, so it fails the state you know is "
+              f"clean too. It returns the same answer whatever is true.")
+        print("     If you introduced the broken state through the ENVIRONMENT — a shim, a PATH, an "
+              "exported variable — that is the likely cause: it makes the two columns two different "
+              "programs. Clean and broken must differ by ARGUMENT.")
+        print(res["clean"][1].rstrip())
+        sys.exit(1)
+    if cr != 0 and br == 0:
+        print("FAIL INVERTED — it passed the BROKEN state and failed the CLEAN one. The gate is "
+              "the right way round about nothing; check its sense, or that the two fixtures are "
+              "not swapped.")
+        sys.exit(1)
+    if cr != 0:
+        print(f"FAIL FALSE RED — the gate failed on the state you know is CLEAN (exit {cr}). "
+              f"Findable, at least: it stops you, which is why these are the ones that get found.")
+        print(res["clean"][1].rstrip())
+        sys.exit(1)
+    print(f"ok   DISCRIMINATES — clean→ok, broken→not-ok (exit {br})")
+    sys.exit(0)
+
+
+def cmd_list(args):
+    seen = set()
+    for dr in search_dirs():
+        if not dr.is_dir():
+            continue
+        for c in sorted(dr.glob("*.chain")):
+            if c.stem in seen:
+                continue
+            seen.add(c.stem)
+            d = parse(c)
+            print(f"{d['chain']:<24} {d['version']:<22} {len(d['steps'])} steps  {d['about']}")
+    if not seen:
+        print("no chains found in: " + ", ".join(str(d) for d in search_dirs()))
+
+
+def cmd_show(args):
+    if not args:
+        die("usage: chain show <chain>")
+    print(resolve(args[0]).read_text(), end="")
+
+
+def cmd_runs(args):
+    if not RUNS.exists():
+        print("no runs recorded"); return
+    rows = RUNS.read_text().splitlines()
+    want = args[0] if args else None
+    for r in rows[1:]:
+        f = r.split("\t")
+        if want and f[1] != want:
+            continue
+        print(f"{f[0]}  {f[1]:<22} {f[3]:<4} {f[4]:<28} {f[5]}/{f[6]} steps"
+              + (f"  blind={f[7]}" if f[7] not in ("0", "") else ""))
+        print(f"{'':<26}{f[8]}")
+
+
+def cmd_last(args):
+    if not RUNS.exists():
+        die("no runs recorded", 1)
+    rows = [r.split("\t") for r in RUNS.read_text().splitlines()[1:]]
+    if args:
+        rows = [r for r in rows if r[1] == args[0]]
+    if not rows:
+        die("no such run", 1)
+    f = rows[-1]
+    print(f"{f[1]} {f[2]}  {f[0]}  mode={f[3]}\n{f[4]}  ({f[5]}/{f[6]} steps)\n"
+          f"file {f[8]}\nlog {f[9]}")
+    sys.exit(0 if f[4].startswith("PASSED") else 1)
+
+
+USAGE = """chain — run SOP steps in order, stop at the first failure, record it.
+
+  chain list                              chains this tree and ~/.config/chain offer
+  chain help  <chain>                     its steps and the parameters it requires
+  chain show  <chain>                     the descriptor itself
+  chain check [path…]                     shape-check descriptors without running anything
+  chain run   <chain> <dry|run> [args…]   execute; all green, or stop with that step's output
+
+A descriptor may end at `terminal: prepared` — a chain PREPARES and a person releases, so such a
+chain reports PREPARED, never PASSED. Anything client-facing ends at the operator.
+  chain columns <cmd…> -- <clean…> -- <broken…>
+                                          run ONE step against a state you know is clean and one
+                                          you know is broken, and compare: a gate returning the
+                                          same answer in both is a CONSTANT, not a check
+  chain runs  [chain]                     the ledger
+  chain last  [chain]                     the last run; exits non-zero if it did not pass
+
+A step is a shell command whose FIRST argument is the run mode and whose remaining arguments are
+the declared parameters, in declared order. `chain run` itself meets that contract, so a chain can
+be a step of another chain."""
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help") and len(sys.argv) == 2:
+        print(USAGE); sys.exit(0)
+    verb, args = sys.argv[1], sys.argv[2:]
+    fn = {"list": cmd_list, "help": cmd_help, "show": cmd_show, "check": cmd_check,
+          "run": cmd_run, "runs": cmd_runs, "last": cmd_last,
+          "columns": cmd_columns}.get(verb)
+    if not fn:
+        die(f"unknown verb '{verb}'\n\n{USAGE}")
+    fn(args)
+
+
+if __name__ == "__main__":
+    main()

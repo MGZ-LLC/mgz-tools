@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+# artefact-version: win11-vm/1.0
+[ "${1:-}" = "--version" ] && { echo "win11-vm/1.0"; exit 0; }
+#
+# win11-vm — manage specialised Windows 11 VMs as copy-on-write overlays of a
+# single immutable "clean install" base, so the base stays pristine and every
+# project gets its own throwaway/specialised VM.
+#
+# Architecture (qcow2 external backing chain + libvirt):
+#   BASE   ~/vm/win11-base-snapshot.qcow2   (read-only, never booted directly)
+#     └── overlay  ~/vm/win11-<name>.qcow2   (copy-on-write, one per project)
+#            └── domain  win11-<name>         (UEFI secure-boot, own NVRAM/MAC)
+#
+# Each specialised VM is derived from the proven GOLDEN domain's hardware
+# definition (q35 + OVMF secure boot + TPM + virtio + host-passthrough CPU),
+# changing only: name, uuid (regenerated), disk -> overlay, NVRAM -> fresh,
+# MAC (regenerated). The clean base is shared read-only as the backing file.
+#
+# Subcommands:
+#   list                 list win11-* domains, state, and their backing chain
+#   base                 show the base image and enforce read-only
+#   create <name> [--dry-run]
+#                        new overlay + domain win11-<name> from the clean base
+#   start  <name>        boot win11-<name> and open its display
+#   view   <name>        open the display of a running win11-<name> (--attach)
+#   put    <name> <file...>   build an ISO of the files and insert it as a CD
+#                            (no network needed — appears as a drive in the VM)
+#   usb    <name> <list|attach|detach> [vid:pid ...]
+#                        pass host USB devices through to the VM (native, managed);
+#                        auto-returns to the host on VM shutdown, never left stranded
+#   mem    <name> <size> set VM memory (e.g. 12G); applies on next start
+#   stop   <name>        graceful shutdown
+#   kill   <name>        force power-off
+#   delete <name>        undefine domain + remove its overlay (never the base)
+#
+# Scripts live in ~/bin (PATH). Requires: libvirt (virsh), virt-viewer, qemu-img.
+
+set -euo pipefail
+
+URI="qemu:///system"
+VM_DIR="$HOME/vm"
+BASE="$VM_DIR/win11-base-snapshot.qcow2"   # the clean just-installed image
+GOLDEN="win11-base"                         # domain used as the hardware template
+PREFIX="win11-"
+
+die()  { echo "win11-vm: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1 || die "required tool not found: $1"; }
+vsh()  { virsh -c "$URI" "$@"; }
+
+have virsh; have qemu-img
+
+dom_exists() { vsh dominfo "$1" >/dev/null 2>&1; }
+
+ensure_base_ro() {
+    [ -f "$BASE" ] || die "base image not found: $BASE"
+    # Read-only protects the shared backing file from accidental writes.
+    if [ -w "$BASE" ]; then
+        chmod 0444 "$BASE" && echo "  base set read-only (0444)"
+    fi
+}
+
+cmd_base() {
+    [ -f "$BASE" ] || die "base image not found: $BASE"
+    echo "Clean base (immutable backing for all specialised VMs):"
+    echo "  $BASE"
+    qemu-img info -U "$BASE" | grep -iE "file format|virtual size|disk size|backing" | sed 's/^/  /'
+    ensure_base_ro
+    echo
+    echo "Do NOT boot or modify this image directly — overlays depend on it byte-for-byte."
+}
+
+cmd_list() {
+    printf "%-22s %-10s %s\n" "DOMAIN" "STATE" "DISK (backing)"
+    printf "%-22s %-10s %s\n" "------" "-----" "--------------"
+    # All defined domains whose name starts with the prefix.
+    vsh list --all --name | grep "^${PREFIX}" | while read -r dom; do
+        [ -n "$dom" ] || continue
+        state="$(vsh domstate "$dom" 2>/dev/null || echo '?')"
+        disk="$(vsh domblklist "$dom" 2>/dev/null | awk '$1=="vda"{print $2}')"
+        backing=""
+        if [ -n "$disk" ] && [ -f "$disk" ]; then
+            b="$(qemu-img info -U "$disk" 2>/dev/null | awk -F': ' '/backing file:/{print $2}')"
+            [ -n "$b" ] && backing="  ←  $(basename "$b")"
+        fi
+        printf "%-22s %-10s %s%s\n" "$dom" "$state" "$(basename "${disk:-?}")" "$backing"
+    done
+}
+
+cmd_create() {
+    local name="${1:-}"; shift || true
+    local dry=0
+    [ "${1:-}" = "--dry-run" ] && dry=1
+    [ -n "$name" ] || die "usage: win11-vm create <name> [--dry-run]"
+    echo "$name" | grep -qE '^[a-z0-9][a-z0-9-]*$' || die "name must be lower-case alnum/dash, e.g. 'bottlefill'"
+
+    local dom="${PREFIX}${name}"
+    local overlay="$VM_DIR/${PREFIX}${name}.qcow2"
+    local nvram="$VM_DIR/nvram/${dom}_VARS.fd"
+
+    dom_exists "$dom" && die "domain already exists: $dom (use 'start $name', or 'delete $name' first)"
+    [ -e "$overlay" ] && die "overlay already exists: $overlay"
+    dom_exists "$GOLDEN" || die "golden template domain not found: $GOLDEN"
+    ensure_base_ro
+
+    # Build the new domain XML from the golden one (proven Win11 hardware).
+    local golden_xml gx new_xml
+    golden_xml="$(vsh dumpxml "$GOLDEN")"
+    gx="$(mktemp --suffix=.xml)"; printf '%s' "$golden_xml" > "$gx"
+    new_xml="$(GOLDEN_OVERLAY="$overlay" GOLDEN_NVRAM="$nvram" GOLDEN_NAME="$dom" \
+               python3 - "$BASE" "$gx" <<'PY'
+import os, sys, xml.etree.ElementTree as ET
+base = sys.argv[1]
+root = ET.fromstring(open(sys.argv[2]).read())
+
+# name + drop uuid (libvirt regenerates a unique one)
+root.find('name').text = os.environ['GOLDEN_NAME']
+for tag in ('uuid',):
+    e = root.find(tag)
+    if e is not None: root.remove(e)
+
+# UEFI: point NVRAM at a fresh per-domain file; keep the template so libvirt
+# creates clean secure-boot vars on first start.
+nv = root.find('./os/nvram')
+if nv is not None:
+    nv.text = os.environ['GOLDEN_NVRAM']
+
+dev = root.find('devices')
+# main disk -> the new overlay; remove install/driver CDROMs except virtio-win
+for disk in list(dev.findall('disk')):
+    dev_type = disk.get('device')
+    src = disk.find('source')
+    if dev_type == 'disk' and disk.find('target').get('dev') == 'vda':
+        src.set('file', os.environ['GOLDEN_OVERLAY'])
+    elif dev_type == 'cdrom':
+        f = (src.get('file') if src is not None else '') or ''
+        if 'virtio-win' in f:
+            pass  # keep: lets you install virtio net/storage drivers
+        else:
+            dev.remove(disk)  # drop the Windows install ISO
+
+# regenerate MAC on every NIC, and use e1000e (Windows 11 has an inbox driver,
+# so the VM networks out-of-the-box — the clean base lacks the VirtIO net driver)
+for iface in dev.findall('interface'):
+    mac = iface.find('mac')
+    if mac is not None: iface.remove(mac)
+    m = iface.find('model')
+    if m is None: m = ET.SubElement(iface, 'model')
+    m.set('type', 'e1000e')
+
+# add an always-present EMPTY transfer CD drive (sdc) so `win11-vm put` can
+# swap media live (drive hot-plug isn't supported for SATA cdrom, media change is)
+if not any(d.find('target') is not None and d.find('target').get('dev') == 'sdc'
+           for d in dev.findall('disk')):
+    cd = ET.SubElement(dev, 'disk', {'type': 'file', 'device': 'cdrom'})
+    ET.SubElement(cd, 'driver', {'name': 'qemu', 'type': 'raw'})
+    ET.SubElement(cd, 'target', {'dev': 'sdc', 'bus': 'sata'})
+    ET.SubElement(cd, 'readonly')
+
+sys.stdout.write(ET.tostring(root, encoding='unicode'))
+PY
+)"
+    rm -f "$gx"
+
+    if [ "$dry" = 1 ]; then
+        echo "# DRY RUN — would create overlay: $overlay (backing: $BASE)"
+        echo "# DRY RUN — would define domain: $dom"
+        echo "----- domain XML -----"
+        echo "$new_xml"
+        return 0
+    fi
+
+    mkdir -p "$VM_DIR/nvram"
+    echo "Creating copy-on-write overlay (base stays untouched)…"
+    qemu-img create -f qcow2 -b "$BASE" -F qcow2 "$overlay" >/dev/null
+    echo "  $overlay  ←  $(basename "$BASE")"
+
+    local tmp; tmp="$(mktemp --suffix=.xml)"
+    printf '%s' "$new_xml" > "$tmp"
+    vsh define "$tmp" >/dev/null
+    rm -f "$tmp"
+    echo "  defined domain: $dom"
+    echo
+    echo "Start it with:  win11-vm start $name"
+}
+
+cmd_start() {
+    local name="${1:-}"; [ -n "$name" ] || die "usage: win11-vm start <name>"
+    local dom="${PREFIX}${name}"
+    dom_exists "$dom" || die "no such domain: $dom (create it: win11-vm create $name)"
+    if [ "$(vsh domstate "$dom")" != "running" ]; then
+        vsh start "$dom"
+    else
+        echo "$dom already running"
+    fi
+    cmd_view "$name"
+}
+
+cmd_view() {
+    local name="${1:-}"; [ -n "$name" ] || die "usage: win11-vm view <name>"
+    local dom="${PREFIX}${name}"
+    have virt-viewer
+    # --attach is REQUIRED: the display lives on a libvirt-owned local socket,
+    # so a direct connect fails with "Display can only be attached … with --attach".
+    setsid virt-viewer --attach --connect "$URI" "$dom" >/dev/null 2>&1 < /dev/null &
+    disown || true
+    echo "opened display for $dom (virt-viewer --attach)"
+}
+
+cmd_put() {
+    local name="${1:-}"; shift || true
+    [ -n "$name" ] && [ "$#" -ge 1 ] || die "usage: win11-vm put <name> <file|dir> [more...]"
+    local dom="${PREFIX}${name}"
+    dom_exists "$dom" || die "no such domain: $dom"
+    have genisoimage
+    for f in "$@"; do [ -e "$f" ] || die "no such file: $f"; done
+
+    local iso="$VM_DIR/transfer-${name}.iso"
+    local drive="sdc"   # dedicated transfer CD drive (sdb is virtio-win)
+
+    # Joliet + Rock Ridge so long Windows filenames survive.
+    genisoimage -quiet -J -joliet-long -r -V "XFER" -o "$iso" "$@"
+    echo "built $iso ($(du -h "$iso" | cut -f1)) from: $*"
+
+    # The transfer drive may exist in the live domain, the persistent config, or
+    # neither — check both (domblklist defaults to live for a running domain).
+    local has_live=0 has_cfg=0 running=0
+    vsh domblklist "$dom"            2>/dev/null | awk '{print $1}' | grep -qx "$drive" && has_live=1
+    vsh domblklist --inactive "$dom" 2>/dev/null | awk '{print $1}' | grep -qx "$drive" && has_cfg=1
+    [ "$(vsh domstate "$dom" 2>/dev/null)" = "running" ] && running=1
+
+    if [ "$has_live" = 1 ] || [ "$has_cfg" = 1 ]; then
+        # drive already exists — reload the disc where it applies.
+        # For the LIVE drive, do a deliberate eject → insert cycle instead of a
+        # single atomic --update swap: Windows caches the CD's table of contents,
+        # so an in-place swap often goes unnoticed until you manually eject,
+        # whereas media-out then media-in forces Explorer to re-read the new disc.
+        if [ "$has_live" = 1 ]; then
+            vsh change-media "$dom" "$drive" --eject --live >/dev/null 2>&1 || true
+            sleep 1
+            vsh change-media "$dom" "$drive" "$iso" --insert --live >/dev/null
+        fi
+        [ "$has_cfg"  = 1 ] && vsh change-media "$dom" "$drive" "$iso" --update --config >/dev/null
+        if [ "$has_live" = 1 ]; then
+            echo "Reloaded live (eject→insert) — the 'XFER' disc now shows the new content, no manual eject needed."
+        else
+            echo "Disc set, but the transfer drive isn't live yet — restart to see it:"
+            echo "    win11-vm stop $name && win11-vm start $name"
+        fi
+    else
+        # no transfer drive anywhere — add one with the disc loaded
+        local x; x="$(mktemp --suffix=.xml)"
+        cat > "$x" <<XML
+<disk type='file' device='cdrom'>
+  <driver name='qemu' type='raw'/>
+  <source file='$iso'/>
+  <target dev='$drive' bus='sata'/>
+  <readonly/>
+</disk>
+XML
+        if [ "$running" = 1 ] && vsh attach-device "$dom" "$x" --live --config 2>/dev/null; then
+            echo "Inserted live — in the VM open File Explorer → This PC → the 'XFER' disc."
+        else
+            vsh attach-device "$dom" "$x" --config
+            echo "Disc added to config — SATA CD can't hot-plug, so restart to see it:"
+            echo "    win11-vm stop $name && win11-vm start $name"
+        fi
+        rm -f "$x"
+    fi
+}
+
+cmd_eject() {
+    local n="${1:?usage: win11-vm eject <name>}"
+    vsh change-media "${PREFIX}${n}" sdc --eject --live 2>&1 || true
+}
+cmd_insert() {
+    local n="${1:?usage: win11-vm insert <name>}"
+    local iso="$VM_DIR/transfer-${n}.iso"
+    [ -f "$iso" ] || die "no transfer disc built yet for $n (use: win11-vm put $n <file>)"
+    vsh change-media "${PREFIX}${n}" sdc --eject --live 2>/dev/null || true
+    vsh change-media "${PREFIX}${n}" sdc "$iso" --insert --live
+    echo "re-inserted $iso into the XFER drive"
+}
+
+cmd_stop() { local n="${1:?usage: win11-vm stop <name>}"; vsh shutdown "${PREFIX}${n}"; }
+cmd_kill() { local n="${1:?usage: win11-vm kill <name>}"; vsh destroy  "${PREFIX}${n}"; }
+
+cmd_delete() {
+    local name="${1:?usage: win11-vm delete <name>}"
+    local dom="${PREFIX}${name}"
+    local overlay="$VM_DIR/${PREFIX}${name}.qcow2"
+    [ "$dom" = "$GOLDEN" ] && die "refusing to delete the golden/base domain '$GOLDEN'"
+    dom_exists "$dom" || die "no such domain: $dom"
+    read -r -p "Delete domain $dom and its overlay $overlay ? [y/N] " a
+    [ "$a" = "y" ] || { echo "aborted"; return 1; }
+    [ "$(vsh domstate "$dom" 2>/dev/null)" = "running" ] && vsh destroy "$dom" || true
+    vsh undefine --nvram "$dom" >/dev/null
+    [ -f "$overlay" ] && rm -f "$overlay"
+    echo "deleted $dom"
+}
+
+# usb — pass host USB devices through to a VM by vendor:product, with automatic
+# return to the host. Uses managed='yes' hostdev (libvirt detaches from the host
+# on attach and REATTACHES on VM shutdown/detach) and --live only (not persisted
+# to the domain config), so a device is on the host whenever no VM is up and is
+# never silently re-grabbed on the next boot.
+#   win11-vm usb <name> list
+#   win11-vm usb <name> attach <vid:pid> [more...]   (VM must be running)
+#   win11-vm usb <name> detach <vid:pid> [more...]
+# e.g. bench instruments:  win11-vm usb tooltest attach 2a8d:1102 1ab1:210b
+#   (2a8d:1102 = Keysight E36312A, 1ab1:210b = Rigol DM858E)
+# NOTE: release any SPICE USB redirection of the device first (un-tick it in the
+# virt-viewer USB menu) — a redirected device is in use and can't be passed through.
+cmd_usb() {
+    local name="${1:-}"; shift || true
+    local action="${1:-}"; shift || true
+    [ -n "$name" ] && [ -n "$action" ] || die "usage: win11-vm usb <name> <list|attach|detach> [vid:pid ...]"
+    local dom="${PREFIX}${name}"
+    dom_exists "$dom" || die "no such domain: $dom"
+    case "$action" in
+        list|ls)
+            echo "USB devices passed through to $dom:"
+            vsh dumpxml "$dom" 2>/dev/null \
+              | awk "/<hostdev mode='subsystem' type='usb'/{f=1} f{print} /<\\/hostdev>/{f=0}" \
+              | grep -iE 'vendor|product' | sed 's/^ */  /' || true
+            ;;
+        attach|add)
+            [ "$#" -ge 1 ] || die "usage: win11-vm usb $name attach <vid:pid> [more...]"
+            [ "$(vsh domstate "$dom" 2>/dev/null)" = "running" ] \
+              || die "$dom is not running — start it first (win11-vm start $name)"
+            local vp
+            for vp in "$@"; do usb_one "$dom" attach "$vp"; done
+            echo "Attached (live, managed): devices auto-return to the HOST on VM shutdown,"
+            echo "and are not re-grabbed on next boot (nothing is left stranded off-host)."
+            ;;
+        detach|rm|remove)
+            [ "$#" -ge 1 ] || die "usage: win11-vm usb $name detach <vid:pid> [more...]"
+            local vp
+            for vp in "$@"; do usb_one "$dom" detach "$vp"; done
+            echo "Detached — devices returned to the host."
+            ;;
+        *) die "usb action must be list | attach | detach" ;;
+    esac
+}
+
+usb_one() {
+    local dom="$1" act="$2" vp="$3"
+    echo "$vp" | grep -qiE '^[0-9a-f]{4}:[0-9a-f]{4}$' \
+      || die "device must be vid:pid in hex, e.g. 2a8d:1102 — got '$vp'"
+    local vid="0x${vp%%:*}" pid="0x${vp##*:}"
+    local x; x="$(mktemp --suffix=.xml)"
+    cat > "$x" <<XML
+<hostdev mode='subsystem' type='usb' managed='yes'>
+  <source>
+    <vendor id='$vid'/>
+    <product id='$pid'/>
+  </source>
+</hostdev>
+XML
+    if [ "$act" = attach ]; then
+        if vsh attach-device "$dom" "$x" --live 2>&1; then
+            echo "  + $vp -> $dom (native USB)"
+        else
+            rm -f "$x"; die "attach $vp failed (is it still SPICE-redirected? un-tick it in virt-viewer first)"
+        fi
+    else
+        # remove from both the live domain and any persisted config, ignore if absent
+        vsh detach-device "$dom" "$x" --live   >/dev/null 2>&1 || true
+        vsh detach-device "$dom" "$x" --config >/dev/null 2>&1 || true
+        echo "  - $vp -> host"
+    fi
+    rm -f "$x"
+}
+
+# mem — set a VM's memory. A running guest can't grow past its boot memory, so
+# this writes the persistent config (max + current) and takes effect on the next
+# start. Size is a libvirt size string, e.g. 12G, 8192M.
+cmd_mem() {
+    local name="${1:-}"; local size="${2:-}"
+    [ -n "$name" ] && [ -n "$size" ] || die "usage: win11-vm mem <name> <size>   e.g. win11-vm mem tooltest 12G"
+    local dom="${PREFIX}${name}"
+    dom_exists "$dom" || die "no such domain: $dom"
+    vsh setmaxmem "$dom" "$size" --config || die "setmaxmem failed"
+    vsh setmem    "$dom" "$size" --config || die "setmem failed"
+    echo "$dom memory set to $size (effective on next start)."
+    if [ "$(vsh domstate "$dom" 2>/dev/null)" = "running" ]; then
+        echo "It's running — restart to apply:  win11-vm stop $name && win11-vm start $name"
+        echo "(USB passthroughs auto-return to the host on stop; re-attach after start.)"
+    fi
+}
+
+usage() { sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-}" in
+    list|ls)   shift; cmd_list "$@";;
+    base)      shift; cmd_base "$@";;
+    create)    shift; cmd_create "$@";;
+    start)     shift; cmd_start "$@";;
+    view)      shift; cmd_view "$@";;
+    put|cp)    shift; cmd_put "$@";;
+    eject)     shift; cmd_eject "$@";;
+    insert)    shift; cmd_insert "$@";;
+    stop)      shift; cmd_stop "$@";;
+    kill)      shift; cmd_kill "$@";;
+    delete|rm) shift; cmd_delete "$@";;
+    usb)       shift; cmd_usb "$@";;
+    mem)       shift; cmd_mem "$@";;
+    ""|-h|--help|help) usage;;
+    *) die "unknown command: $1 (try: win11-vm help)";;
+esac
